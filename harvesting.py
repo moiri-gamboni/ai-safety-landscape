@@ -520,6 +520,34 @@ def inspect_papers(conn, limit=5):
     avg_authors_per_paper = c.fetchone()[0]
     print(f"\nAverage Authors per Paper: {avg_authors_per_paper:.2f}")
     
+    # Affiliation statistics
+    print("\nAffiliations:")
+    c.execute('SELECT COUNT(DISTINCT affiliation) FROM author_affiliations')
+    total_unique_affiliations = c.fetchone()[0]
+    print(f"Unique Affiliations: {total_unique_affiliations}")
+    
+    c.execute('SELECT COUNT(*) FROM author_affiliations')
+    total_affiliation_links = c.fetchone()[0]
+    print(f"Total Author-Affiliation Links: {total_affiliation_links}")
+    
+    c.execute('''
+        SELECT COUNT(*) FROM 
+        (SELECT author_id FROM author_affiliations GROUP BY author_id)
+    ''')
+    authors_with_affiliations = c.fetchone()[0]
+    print(f"Authors with Affiliations: {authors_with_affiliations} ({(authors_with_affiliations/total_authors*100):.1f}% of authors)")
+    
+    print("\nTop 10 Affiliations:")
+    c.execute('''
+        SELECT affiliation, COUNT(*) as count
+        FROM author_affiliations
+        GROUP BY affiliation
+        ORDER BY count DESC
+        LIMIT 10
+    ''')
+    for affiliation, count in c.fetchall():
+        print(f"- {affiliation}: {count} authors")
+    
     # Metadata field statistics
     print("\nMetadata Field Coverage:")
     fields = [
