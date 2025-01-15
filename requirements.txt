@@ -1,12 +1,6 @@
-arxiv
-transformers
-torch
-numpy
-pandas
-scikit-learn
-umap-learn
-hdbscan
 tqdm
 jupyter
 ipykernel
 sickle
+pre-commit
+jupytext

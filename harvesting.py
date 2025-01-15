@@ -1,7 +1,13 @@
+# ---
+# jupyter:
+#   jupytext:
+#     formats: ipynb,py:percent
+# ---
+
 # %% [markdown]
 # # AI Safety Papers Visualization - Phase 1
 #
-# This notebook implements Phase 1 of the AI Safety Papers visualization project, focusing on:
+# This notebook implements Phase 1 of the AI Safety Papers visualization project:
 # 1. Metadata Collection using arXiv OAI-PMH API
 # 2. Abstract Embedding Generation using ModernBERT-large
 # 3. Initial Clustering using UMAP and HDBSCAN
@@ -164,7 +170,6 @@ else:
 from sickle import Sickle
 from sickle.models import Record
 from tqdm import tqdm
-import numpy as np
 
 class ArxivRecord(Record):
     """Custom record class for arXiv metadata format"""

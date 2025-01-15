@@ -1,0 +1,10 @@
+repos:
+-   repo: local
+    hooks:
+    -   id: jupytext
+        name: jupytext
+        entry: bash -c 'jupytext --to notebook "$1" && git add "${1%.*}.ipynb"' --
+        language: python
+        additional_dependencies: [jupytext]
+        files: ^.*\.py$
+        stages: [pre-commit]
