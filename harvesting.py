@@ -17,15 +17,6 @@
 %pip install -r requirements.txt
 
 # %% [markdown]
-# ## Configuration Parameters
-
-# %%
-# @title Data Collection Parameters
-# Set to 0 to fetch all CS papers (warning: this will take a long time)
-# Set to a positive number to fetch only that many papers
-num_papers = 100 # @param {type:"slider", min:0, max:10000, step:100}
-
-# %% [markdown]
 # ## 1. Database Setup
 
 # %%
@@ -165,11 +156,23 @@ else:
 
 # %% [markdown]
 # ## 2. Metadata Harvesting
+#
+# ### Configuration
+# - **Number of Papers**: Control how many papers to fetch. Set to 0 to fetch all CS papers (warning: this will take a long time).
+# - **Resumption Token**: If harvesting was interrupted, paste the resumption token here to continue from where you left off.
+#   You can paste the full URL or just the token - URL-encoded characters (like %7C) will be automatically converted.
+
+# %%
+# @title Harvesting Configuration  {"run":"auto"}
+num_papers = 100 # @param {type:"slider", min:0, max:10000, step:100}
+resumption_token = "" # @param {type:"string"}
 
 # %%
 from sickle import Sickle
 from sickle.models import Record
 from tqdm import tqdm
+import urllib.parse
+import re
 
 class ArxivRecord(Record):
     """Custom record class for arXiv metadata format"""
@@ -313,7 +316,7 @@ def save_papers(papers, conn):
             
     conn.commit()
 
-def fetch_cs_papers(start_index=0, max_results=None):
+def fetch_cs_papers(start_index=0, max_results=None, resumption_token=None):
     """Fetch CS papers from arXiv using OAI-PMH with arXiv metadata format"""
     # Create Sickle client with retry configuration
     sickle = Sickle('http://export.arxiv.org/oai2',
@@ -327,42 +330,73 @@ def fetch_cs_papers(start_index=0, max_results=None):
     papers = []
     try:
         # Use ListRecords with arXiv metadata format
-        records = sickle.ListRecords(
-            metadataPrefix='arXiv',  # Use arXiv's native format
-            set='cs',
-            ignore_deleted=True
-        )
+        if resumption_token:
+            # Extract token from URL if full URL was pasted
+            if 'resumptionToken=' in resumption_token:
+                resumption_token = re.search(r'resumptionToken=([^&]+)', resumption_token).group(1)
+            # Unescape the token
+            resumption_token = urllib.parse.unquote(resumption_token)
+            records = sickle.ListRecords(resumptionToken=resumption_token)
+        else:
+            records = sickle.ListRecords(
+                metadataPrefix='arXiv',  # Use arXiv's native format
+                set='cs',
+                ignore_deleted=True
+            )
         
         # Process records with progress bar
         with tqdm(desc="Fetching papers", unit=" papers") as pbar:
-            for record in records:
+            while True:
                 try:
-                    metadata = record.get_metadata()
-                    if metadata and metadata.get('id'):  # Only add if we have valid metadata
-                        papers.append(metadata)
-                        pbar.update(1)
-                        
-                        # Respect max_results limit if set
-                        if max_results and len(papers) >= max_results:
-                            break
+                    record = next(records)
+                    try:
+                        metadata = record.get_metadata()
+                        if metadata and metadata.get('id'):  # Only add if we have valid metadata
+                            papers.append(metadata)
+                            pbar.update(1)
+                            
+                            # Respect max_results limit if set
+                            if max_results and len(papers) >= max_results:
+                                break
+                    except Exception as e:
+                        print(f"Error processing record: {str(e)}")
+                        continue
+                except StopIteration:
+                    break
                 except Exception as e:
-                    print(f"Error processing record: {str(e)}")
-                    continue
+                    # Get the current resumption token from the Sickle iterator
+                    if hasattr(records, 'resumption_token'):
+                        print(f"\nError occurred. Current resumption token: {records.resumption_token}")
+                    raise  # Re-raise the exception to let Sickle's retry mechanism handle it
                     
     except Exception as e:
         print(f"Error during harvesting: {str(e)}")
+        # Print final resumption token if available
+        if hasattr(records, 'resumption_token'):
+            print(f"Final resumption token: {records.resumption_token}")
         
     return papers
 
 # %%
 # Fetch papers using the slider value (None for all papers)
-initial_papers = fetch_cs_papers(max_results=num_papers if num_papers > 0 else None)
-save_papers(initial_papers, conn)
-
-# Print summary
+# First check current database count
 c = conn.cursor()
 c.execute('SELECT COUNT(*) FROM papers')
-print(f"Total papers in database: {c.fetchone()[0]}")
+current_count = c.fetchone()[0]
+print(f"Current papers in database before harvesting: {current_count}")
+
+initial_papers = fetch_cs_papers(
+    max_results=num_papers if num_papers > 0 else None,
+    resumption_token=resumption_token if resumption_token else None
+)
+save_papers(initial_papers, conn)
+
+# Print final count
+c.execute('SELECT COUNT(*) FROM papers')
+final_count = c.fetchone()[0]
+print(f"\nHarvesting complete:")
+print(f"- Papers added this session: {final_count - current_count}")
+print(f"- Total papers in database: {final_count}")
 
 # %% [markdown]
 # ## Data Quality Check
