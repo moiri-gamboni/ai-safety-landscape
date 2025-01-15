@@ -440,6 +440,30 @@ def inspect_papers(conn, limit=5):
     print(f"\nPapers:")
     print(f"Total Papers: {total_papers}")
     
+    # Count cs.AI papers
+    c.execute("SELECT COUNT(*) FROM papers WHERE categories LIKE '%cs.AI%'")
+    ai_papers = c.fetchone()[0]
+    print(f"CS.AI Papers: {ai_papers} ({(ai_papers/total_papers*100):.1f}% of total)")
+    
+    # Category statistics
+    print("\nTop Categories:")
+    c.execute('''
+        SELECT category, COUNT(*) as count
+        FROM (
+            SELECT TRIM(value) as category
+            FROM papers, json_each('["' || REPLACE(categories, ' ', '","') || '"]')
+            WHERE categories IS NOT NULL
+        )
+        WHERE category != ''
+        GROUP BY category
+        ORDER BY count DESC
+        LIMIT 10
+    ''')
+    for category, count in c.fetchall():
+        if category:  # Skip empty category
+            percentage = (count / total_papers) * 100
+            print(f"{category}: {count} papers ({percentage:.1f}%)")
+    
     # Author statistics
     c.execute('SELECT COUNT(*) FROM authors')
     total_authors = c.fetchone()[0]
@@ -475,20 +499,6 @@ def inspect_papers(conn, limit=5):
         present = c.fetchone()[0]
         percentage = (present / total_papers) * 100 if total_papers > 0 else 0
         print(f"{field}: {present}/{total_papers} ({percentage:.1f}%)")
-    
-    # Category statistics
-    print("\nTop Categories:")
-    c.execute('''
-        SELECT categories, COUNT(*) as count 
-        FROM papers 
-        WHERE categories IS NOT NULL 
-        GROUP BY categories 
-        ORDER BY count DESC 
-        LIMIT 5
-    ''')
-    for category, count in c.fetchall():
-        percentage = (count / total_papers) * 100
-        print(f"{category}: {count} papers ({percentage:.1f}%)")
 
 # Inspect sample papers
 inspect_papers(conn) 
