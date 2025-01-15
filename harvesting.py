@@ -124,7 +124,7 @@ def create_database():
     c.execute("CREATE INDEX IF NOT EXISTS idx_final_cluster_id ON papers(final_cluster_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_is_relevant ON papers(is_relevant)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_categories ON papers(categories)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_authors_names ON authors(keyname, forenames)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_authors_unique ON authors(keyname, forenames, suffix)")
     
     conn.commit()
     return conn
@@ -136,6 +136,9 @@ conn = create_database()
 # ## Load Existing Database
 
 # %%
+import sqlite3
+import os
+
 # Mount Google Drive
 from google.colab import drive
 drive.mount('/content/drive')
@@ -250,6 +253,19 @@ def save_papers(papers, conn):
     """Save papers and authors to SQLite database"""
     c = conn.cursor()
     
+    def normalize_suffix(suffix):
+        """Normalize author suffixes to a standard format"""
+        if not suffix:
+            return None
+        suffix = suffix.strip()
+        # Normalize Jr variations
+        if suffix.upper() in ['JR', 'JR.', 'JR ', 'JUNIOR']:
+            return 'Jr.'
+        # Normalize roman numerals
+        if suffix.upper() in ['I', 'II', 'III', 'IV', 'V']:
+            return suffix.upper()
+        return suffix
+    
     for paper in papers:
         try:
             # Insert paper with all fields
@@ -274,6 +290,9 @@ def save_papers(papers, conn):
             
             # Process authors
             for pos, author in enumerate(paper['authors'], 1):
+                # Normalize the suffix
+                author['suffix'] = normalize_suffix(author.get('suffix'))
+                
                 # Insert author if not exists
                 c.execute('''
                     INSERT OR IGNORE INTO authors (keyname, forenames, suffix)
@@ -465,26 +484,41 @@ def inspect_papers(conn, limit=5):
             print(f"{category}: {count} papers ({percentage:.1f}%)")
     
     # Author statistics
+    print(f"\nAuthors:")
     c.execute('SELECT COUNT(*) FROM authors')
     total_authors = c.fetchone()[0]
+    print(f"Total Authors: {total_authors}")
     
     c.execute('SELECT COUNT(*) FROM paper_authors')
     total_author_links = c.fetchone()[0]
+    print(f"Total Author-Paper Links: {total_author_links}")
+    
+    # Papers per author distribution
+    print("\nPapers per author distribution:")
+    c.execute('''
+        SELECT papers_count, COUNT(*) as authors_with_this_many_papers
+        FROM (
+            SELECT author_id, COUNT(*) as papers_count
+            FROM paper_authors
+            GROUP BY author_id
+        )
+        GROUP BY papers_count
+        ORDER BY papers_count
+        LIMIT 10
+    ''')
+    for paper_count, author_count in c.fetchall():
+        print(f"{author_count} authors have {paper_count} paper(s)")
     
     c.execute('''
         SELECT COUNT(*) FROM 
         (SELECT author_id FROM paper_authors GROUP BY author_id HAVING COUNT(*) > 1)
     ''')
     authors_multiple_papers = c.fetchone()[0]
+    print(f"\nAuthors with Multiple Papers: {authors_multiple_papers}")
     
     c.execute('SELECT AVG(author_count) FROM (SELECT paper_id, COUNT(*) as author_count FROM paper_authors GROUP BY paper_id)')
     avg_authors_per_paper = c.fetchone()[0]
-    
-    print(f"\nAuthors:")
-    print(f"Total Authors: {total_authors}")
-    print(f"Total Author-Paper Links: {total_author_links}")
-    print(f"Authors with Multiple Papers: {authors_multiple_papers}")
-    print(f"Average Authors per Paper: {avg_authors_per_paper:.2f}")
+    print(f"\nAverage Authors per Paper: {avg_authors_per_paper:.2f}")
     
     # Metadata field statistics
     print("\nMetadata Field Coverage:")
@@ -494,7 +528,6 @@ def inspect_papers(conn, limit=5):
     ]
     
     for field in fields:
-        # Count non-null values
         c.execute(f'SELECT COUNT(*) FROM papers WHERE {field} IS NOT NULL')
         present = c.fetchone()[0]
         percentage = (present / total_papers) * 100 if total_papers > 0 else 0
@@ -507,10 +540,6 @@ inspect_papers(conn)
 # ## Save Database to Drive
 
 # %%
-# Mount Google Drive
-from google.colab import drive
-drive.mount('/content/drive')
-
 # Create project directory if it doesn't exist
 !mkdir -p "/content/drive/MyDrive/ai-safety-papers"
 
