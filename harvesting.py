@@ -56,10 +56,39 @@ else:
 import sqlite3
 import os
 
+def get_sqlite_variable_limit(conn):
+    """Get the maximum number of variables allowed in a SQLite query"""
+    c = conn.cursor()
+    c.execute('PRAGMA compile_options')
+    compile_options = c.fetchall()
+    for option in compile_options:
+        if 'MAX_VARIABLE_NUMBER=' in option[0]:
+            return int(option[0].split('=')[1])
+    return 999  # Default SQLite limit if not found
+
+def get_safe_batch_size(conn, vars_per_item=1):
+    """Calculate a safe batch size based on SQLite's variable limit
+    
+    Args:
+        conn: SQLite connection
+        vars_per_item: Number of variables needed per item in a batch
+        
+    Returns:
+        int: Safe batch size that won't exceed SQLite's variable limit
+    """
+    max_vars = get_sqlite_variable_limit(conn)
+    # Use 90% of the limit to be safe
+    safe_vars = int(max_vars * 0.9)
+    return safe_vars // vars_per_item
+
 def create_database():
     """Create SQLite database with necessary tables"""
     conn = sqlite3.connect('papers.db')
     c = conn.cursor()
+    
+    # Print SQLite variable limit
+    max_vars = get_sqlite_variable_limit(conn)
+    print(f"SQLite max variables per query: {max_vars}")
     
     # Create papers table with all arXiv metadata fields
     c.execute('''
@@ -290,112 +319,98 @@ def save_papers(papers, conn):
             return suffix.upper()
         return suffix
     
-    # Prepare batch data
-    paper_data = []
-    author_data = set()  # Use set to deduplicate authors
-    paper_author_data = []
-    affiliation_data = set()  # Use set to deduplicate affiliations
-    
-    # Collect all data first
-    for paper in papers:
-        # Collect paper data
-        paper_data.append((
-            paper['id'],
-            paper.get('title'),
-            paper.get('abstract'),
-            paper.get('categories'),
-            paper.get('msc_class'),
-            paper.get('acm_class'),
-            paper.get('doi'),
-            paper.get('license'),
-            paper.get('comments')
-        ))
-        
-        # Collect author and affiliation data
-        for pos, author in enumerate(paper['authors'], 1):
-            # Normalize suffix
-            suffix = normalize_suffix(author.get('suffix'))
-            
-            # Add author to set
-            author_tuple = (
-                author['keyname'],
-                author.get('forenames'),
-                suffix
-            )
-            author_data.add(author_tuple)
-            
-            # Store paper-author relationship with position
-            paper_author_data.append((
-                paper['id'],
-                author_tuple,  # We'll replace this with ID after inserting authors
-                pos
-            ))
-            
-            # Add affiliations to set
-            for affiliation in author.get('affiliations', []):
-                affiliation_data.add((author_tuple, affiliation))
-    
-    try:
-        # Batch insert papers
-        c.executemany('''
-            INSERT OR IGNORE INTO papers (
-                id, title, abstract, categories,
-                msc_class, acm_class, doi, license, comments
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', paper_data)
-        
-        # Batch insert authors and get their IDs
-        author_id_map = {}  # Map author tuple to ID
-        c.executemany('''
-            INSERT OR IGNORE INTO authors (keyname, forenames, suffix)
-            VALUES (?, ?, ?)
-        ''', author_data)
-        
-        # Get all author IDs in one query
-        placeholders = ','.join(['(?, ?, ?)'] * len(author_data))
-        c.execute(f'''
-            SELECT id, keyname, forenames, suffix 
-            FROM authors 
-            WHERE (keyname, forenames, suffix) IN ({placeholders})
-        ''', [val for author in author_data for val in author])
-        
-        for row in c.fetchall():
-            author_id_map[author_tuple] = row[0]
-        
-        # Update paper-author data with real IDs
-        paper_author_final = []
-        for paper_id, author_tuple, pos in paper_author_data:
+    print(f"\nSaving {len(papers)} papers and their authors...")
+    with tqdm(total=len(papers), desc="Saving papers", unit=" papers",
+              miniters=500,
+              smoothing=0.8
+              ) as pbar:
+        for paper in papers:
             try:
-                author_id = author_id_map[author_tuple]
-                paper_author_final.append((paper_id, author_id, pos))
-            except KeyError:
-                print(f"Warning: Could not find ID for author {author_tuple}")
-        
-        # Batch insert paper-author relationships
-        c.executemany('''
-            INSERT OR IGNORE INTO paper_authors (paper_id, author_id, author_position)
-            VALUES (?, ?, ?)
-        ''', paper_author_final)
-        
-        # Batch insert affiliations
-        affiliation_final = [
-            (author_id_map[author_tuple], affiliation)
-            for author_tuple, affiliation in affiliation_data
-        ]
-        c.executemany('''
-            INSERT OR IGNORE INTO author_affiliations (author_id, affiliation)
-            VALUES (?, ?)
-        ''', affiliation_final)
-        
-        conn.commit()
-        
-    except sqlite3.IntegrityError as e:
-        print(f"Error during batch operations: {str(e)}")
-        conn.rollback()
+                # Insert paper with all fields
+                c.execute('''
+                    INSERT OR IGNORE INTO papers (
+                        id, title, abstract, categories,
+                        msc_class, acm_class, doi, license, comments
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    paper['id'], 
+                    paper.get('title'),
+                    paper.get('abstract'),
+                    paper.get('categories'),
+                    paper.get('msc_class'),
+                    paper.get('acm_class'),
+                    paper.get('doi'),
+                    paper.get('license'),
+                    paper.get('comments')
+                ))
+                
+                # Process authors
+                for pos, author in enumerate(paper['authors'], 1):
+                    # Clean and normalize author fields
+                    keyname = author['keyname'].strip()
+                    forenames = author.get('forenames', '').strip() if author.get('forenames') else ''
+                    suffix = normalize_suffix(author.get('suffix'))
+                    
+                    # First try to find existing author with normalized fields
+                    c.execute('''
+                        SELECT id FROM authors 
+                        WHERE keyname = ? AND 
+                              COALESCE(forenames, '') = ? AND
+                              COALESCE(suffix, '') = COALESCE(?, '')
+                    ''', (
+                        keyname,
+                        forenames,
+                        suffix
+                    ))
+                    result = c.fetchone()
+                    
+                    if result:
+                        author_id = result[0]
+                    else:
+                        # Insert new author with normalized fields
+                        c.execute('''
+                            INSERT INTO authors (keyname, forenames, suffix)
+                            VALUES (?, ?, ?)
+                        ''', (
+                            keyname,
+                            forenames if forenames else None,  # Store NULL if empty
+                            suffix  # Already normalized
+                        ))
+                        author_id = c.lastrowid
+                    
+                    # Create paper-author relationship
+                    c.execute('''
+                        INSERT OR IGNORE INTO paper_authors (paper_id, author_id, author_position)
+                        VALUES (?, ?, ?)
+                    ''', (paper['id'], author_id, pos))
+                    
+                    # Add any affiliations
+                    for affiliation in author.get('affiliations', []):
+                        if affiliation and affiliation.strip():  # Only add non-empty affiliations
+                            c.execute('''
+                                INSERT OR IGNORE INTO author_affiliations (author_id, affiliation)
+                                VALUES (?, ?)
+                            ''', (author_id, affiliation.strip()))
+                
+                pbar.update(1)
+                    
+            except sqlite3.IntegrityError as e:
+                print(f"Error saving paper {paper['id']}: {str(e)}")
+                continue
+                
+    conn.commit()
 
 def save_versions(paper_versions, conn):
     """Save paper version information to database efficiently"""
     c = conn.cursor()
+    
+    # Calculate batch sizes
+    VERSION_BATCH_SIZE = get_safe_batch_size(conn, vars_per_item=5)  # 5 vars per version
+    PAPER_UPDATE_BATCH_SIZE = get_safe_batch_size(conn, vars_per_item=4)  # 4 vars per paper update
+    
+    print(f"Using batch sizes:")
+    print(f"- Versions: {VERSION_BATCH_SIZE}")
+    print(f"- Paper Updates: {PAPER_UPDATE_BATCH_SIZE}")
     
     # Prepare batch data
     paper_updates = []
@@ -433,18 +448,22 @@ def save_versions(paper_versions, conn):
     
     try:
         # Batch update papers
-        c.executemany('''
-            UPDATE papers 
-            SET created = ?, updated = ?, withdrawn = ?
-            WHERE id = ?
-        ''', paper_updates)
+        for i in range(0, len(paper_updates), PAPER_UPDATE_BATCH_SIZE):
+            batch = paper_updates[i:i + PAPER_UPDATE_BATCH_SIZE]
+            c.executemany('''
+                UPDATE papers 
+                SET created = ?, updated = ?, withdrawn = ?
+                WHERE id = ?
+            ''', batch)
         
         # Batch insert versions
-        c.executemany('''
-            INSERT OR IGNORE INTO paper_versions (
-                paper_id, version, source_type, size, date
-            ) VALUES (?, ?, ?, ?, ?)
-        ''', version_inserts)
+        for i in range(0, len(version_inserts), VERSION_BATCH_SIZE):
+            batch = version_inserts[i:i + VERSION_BATCH_SIZE]
+            c.executemany('''
+                INSERT OR IGNORE INTO paper_versions (
+                    paper_id, version, source_type, size, date
+                ) VALUES (?, ?, ?, ?, ?)
+            ''', batch)
         
         conn.commit()
         
@@ -480,7 +499,10 @@ def fetch_arxiv_records(metadata_prefix, record_class, max_results=None, resumpt
         
         # Process records with progress bar
         results = []
-        with tqdm(desc=f"Fetching {metadata_prefix}", unit=" papers") as pbar:
+        with tqdm(desc=f"Fetching {metadata_prefix}", unit=" papers",
+                 miniters=25,
+                 smoothing=0.8
+                 ) as pbar:
             while True:
                 try:
                     record = next(records)
@@ -757,4 +779,34 @@ drive.mount('/content/drive')
 
 # Copy database to Drive
 !cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db"
-print("Database saved to Google Drive at: /ai-safety-papers/papers.db") 
+print("Database saved to Google Drive at: /ai-safety-papers/papers.db")
+
+# %% [markdown]
+# ## Database Cleanup
+# Use this cell if harvesting was interrupted and you need to clean up and retry with the data in memory.
+# Only run this if you still have the `initial_papers` variable in memory from a previous interrupted run.
+
+# %%
+# Drop all tables in correct order (respecting foreign key constraints)
+c = conn.cursor()
+c.execute("DROP TABLE IF EXISTS paper_versions")
+c.execute("DROP TABLE IF EXISTS author_affiliations")
+c.execute("DROP TABLE IF EXISTS paper_authors")
+c.execute("DROP TABLE IF EXISTS authors")
+c.execute("DROP TABLE IF EXISTS papers")
+conn.commit()
+
+# Recreate tables
+create_database()
+
+# Resave papers from memory
+if 'initial_papers' in locals():
+    print("Found papers in memory, saving them...")
+    save_papers(initial_papers, conn)
+    
+    # Print count of saved papers
+    c.execute('SELECT COUNT(*) FROM papers')
+    final_count = c.fetchone()[0]
+    print(f"\nPapers saved after cleanup: {final_count}")
+else:
+    print("No papers found in memory. You'll need to run the harvesting cell again.") 
