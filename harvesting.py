@@ -133,16 +133,6 @@ def create_database():
         )
     ''')
     
-    # Create author affiliations table (since it's maxOccurs=unbounded in schema)
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS author_affiliations (
-            author_id INTEGER,
-            affiliation TEXT NOT NULL,
-            PRIMARY KEY (author_id, affiliation),
-            FOREIGN KEY (author_id) REFERENCES authors(id)
-        )
-    ''')
-    
     # Create paper_authors junction table
     c.execute('''
         CREATE TABLE IF NOT EXISTS paper_authors (
@@ -246,12 +236,6 @@ class ArxivRecord(Record):
                 
                 suffix_elem = author_elem.find('arxiv:suffix', namespaces=ns)
                 author['suffix'] = suffix_elem.text if suffix_elem is not None and suffix_elem.text else None
-                
-                # Multiple affiliations possible
-                author['affiliations'] = []
-                for affiliation_elem in author_elem.findall('arxiv:affiliation', namespaces=ns):
-                    if affiliation_elem is not None and affiliation_elem.text:
-                        author['affiliations'].append(affiliation_elem.text)
                 
                 authors.append(author)
         
@@ -383,14 +367,6 @@ def save_papers(papers, conn):
                         INSERT OR IGNORE INTO paper_authors (paper_id, author_id, author_position)
                         VALUES (?, ?, ?)
                     ''', (paper['id'], author_id, pos))
-                    
-                    # Add any affiliations
-                    for affiliation in author.get('affiliations', []):
-                        if affiliation and affiliation.strip():  # Only add non-empty affiliations
-                            c.execute('''
-                                INSERT OR IGNORE INTO author_affiliations (author_id, affiliation)
-                                VALUES (?, ?)
-                            ''', (author_id, affiliation.strip()))
                 
                 pbar.update(1)
                     
@@ -697,34 +673,6 @@ def inspect_papers(conn, limit=5):
     avg_authors_per_paper = c.fetchone()[0]
     print(f"\nAverage Authors per Paper: {avg_authors_per_paper:.2f}")
     
-    # Affiliation statistics
-    print("\nAffiliations:")
-    c.execute('SELECT COUNT(DISTINCT affiliation) FROM author_affiliations')
-    total_unique_affiliations = c.fetchone()[0]
-    print(f"Unique Affiliations: {total_unique_affiliations}")
-    
-    c.execute('SELECT COUNT(*) FROM author_affiliations')
-    total_affiliation_links = c.fetchone()[0]
-    print(f"Total Author-Affiliation Links: {total_affiliation_links}")
-    
-    c.execute('''
-        SELECT COUNT(*) FROM 
-        (SELECT author_id FROM author_affiliations GROUP BY author_id)
-    ''')
-    authors_with_affiliations = c.fetchone()[0]
-    print(f"Authors with Affiliations: {authors_with_affiliations} ({(authors_with_affiliations/total_authors*100):.1f}% of authors)")
-    
-    print("\nTop 10 Affiliations:")
-    c.execute('''
-        SELECT affiliation, COUNT(*) as count
-        FROM author_affiliations
-        GROUP BY affiliation
-        ORDER BY count DESC
-        LIMIT 10
-    ''')
-    for affiliation, count in c.fetchall():
-        print(f"- {affiliation}: {count} authors")
-    
     # Metadata field statistics
     print("\nMetadata Field Coverage:")
     fields = [
@@ -790,7 +738,6 @@ print("Database saved to Google Drive at: /ai-safety-papers/papers.db")
 # Drop all tables in correct order (respecting foreign key constraints)
 c = conn.cursor()
 c.execute("DROP TABLE IF EXISTS paper_versions")
-c.execute("DROP TABLE IF EXISTS author_affiliations")
 c.execute("DROP TABLE IF EXISTS paper_authors")
 c.execute("DROP TABLE IF EXISTS authors")
 c.execute("DROP TABLE IF EXISTS papers")
