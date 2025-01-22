@@ -520,6 +520,11 @@ def fetch_raw_metadata(max_results=None, resumption_token=None):
     """Fetch paper version information from arXiv using OAI-PMH with arXivRaw metadata format"""
     return fetch_arxiv_records('arXivRaw', ArxivRawRecord, max_results, resumption_token)
 
+# %% [markdown]
+# ## Harvest arXiv Metadata
+# This cell fetches the main metadata (titles, abstracts, authors, etc.) from arXiv's OAI-PMH API.
+# You can run this cell independently and save the database before proceeding to raw metadata harvesting.
+
 # %%
 # Fetch papers using the slider value (None for all papers)
 # First check current database count
@@ -528,26 +533,44 @@ c.execute('SELECT COUNT(*) FROM papers')
 current_count = c.fetchone()[0]
 print(f"Current papers in database before harvesting: {current_count}")
 
-# First fetch papers with arXiv metadata
+# Fetch papers with arXiv metadata
 initial_papers = fetch_cs_papers(
     max_results=num_papers if num_papers > 0 else None,
     resumption_token=resumption_token if resumption_token else None
 )
 save_papers(initial_papers, conn)
 
-# Then fetch version information with arXivRaw
+# Print final count
+c.execute('SELECT COUNT(*) FROM papers')
+final_count = c.fetchone()[0]
+print(f"\nMetadata harvesting complete:")
+print(f"- Papers added this session: {final_count - current_count}")
+print(f"- Total papers in database: {final_count}")
+
+# %% [markdown]
+# ## Harvest arXiv Raw Metadata
+# This cell fetches additional metadata about paper versions from arXiv's OAI-PMH API using the arXivRaw format.
+# You can run this cell separately after running the main metadata harvesting above.
+# 
+# **Note**: Make sure to run the database loading cell first if you're running this in a new session.
+
+# %%
+# Fetch version information with arXivRaw
 paper_versions = fetch_raw_metadata(
     max_results=num_papers if num_papers > 0 else None,
     resumption_token=resumption_token if resumption_token else None
 )
 save_versions(paper_versions, conn)
 
-# Print final count
-c.execute('SELECT COUNT(*) FROM papers')
-final_count = c.fetchone()[0]
-print(f"\nHarvesting complete:")
-print(f"- Papers added this session: {final_count - current_count}")
-print(f"- Total papers in database: {final_count}")
+# Print final stats about versions
+c = conn.cursor()
+c.execute('SELECT COUNT(*) FROM paper_versions')
+version_count = c.fetchone()[0]
+c.execute('SELECT COUNT(DISTINCT paper_id) FROM paper_versions')
+papers_with_versions = c.fetchone()[0]
+print(f"\nRaw metadata harvesting complete:")
+print(f"- Total versions stored: {version_count}")
+print(f"- Papers with version info: {papers_with_versions}")
 
 # %% [markdown]
 # ## Data Quality Check
