@@ -30,7 +30,7 @@ if os.path.exists(db_path):
     c.execute('SELECT COUNT(*) FROM papers')
     print(f"Database contains {c.fetchone()[0]} papers")
 else:
-    print("No existing database found in Drive. Will create new one.")
+    raise Exception("No existing database found in Drive.")
 
 # %% [markdown]
 # ## Clean Up Author Duplicates
@@ -253,6 +253,111 @@ def cleanup_authors(conn):
 
 # Run cleanup if needed
 cleanup_authors(conn)
+
+# %% [markdown]
+# ## Clean Up Author Commas
+# Run this cell to fix author keynames that incorrectly include trailing commas.
+
+# %%
+def cleanup_author_commas(conn):
+    """Clean up author keynames that incorrectly include trailing commas by merging with existing authors"""
+    c = conn.cursor()
+    print("Starting author comma cleanup...")
+    
+    try:
+        # Start transaction
+        c.execute('BEGIN TRANSACTION')
+        
+        # Find authors with trailing commas in keyname
+        c.execute('''
+            SELECT id, keyname, forenames, suffix
+            FROM authors
+            WHERE keyname LIKE '%,'
+        ''')
+        authors_to_fix = c.fetchall()
+        
+        if not authors_to_fix:
+            print("No authors found with trailing commas in keyname")
+            return
+            
+        print(f"\nFound {len(authors_to_fix)} authors with trailing commas in keyname")
+        
+        # Create temporary mapping table
+        c.execute('DROP TABLE IF EXISTS author_comma_mapping')
+        c.execute('''
+            CREATE TABLE author_comma_mapping (
+                old_id INTEGER PRIMARY KEY,
+                new_id INTEGER NOT NULL
+            )
+        ''')
+        
+        # Process each author
+        for author_id, keyname, forenames, suffix in authors_to_fix:
+            fixed_keyname = keyname.rstrip(',')
+            print(f"\nProcessing author {author_id}:")
+            print(f"  Before: keyname='{keyname}', forenames='{forenames or ''}', suffix='{suffix or ''}'")
+            print(f"  After:  keyname='{fixed_keyname}', forenames='{forenames or ''}', suffix='{suffix or ''}'")
+            
+            # Check if normalized version already exists
+            c.execute('''
+                SELECT id FROM authors 
+                WHERE keyname = ? AND 
+                      COALESCE(forenames, '') = COALESCE(?, '') AND
+                      COALESCE(suffix, '') = COALESCE(?, '')
+            ''', (fixed_keyname, forenames, suffix))
+            
+            existing = c.fetchone()
+            if existing:
+                existing_id = existing[0]
+                print(f"  Found existing author with ID {existing_id}")
+                
+                # Map old ID to existing ID
+                c.execute('INSERT INTO author_comma_mapping (old_id, new_id) VALUES (?, ?)',
+                         (author_id, existing_id))
+                
+                # Update paper_authors to use existing ID
+                c.execute('''
+                    UPDATE OR IGNORE paper_authors 
+                    SET author_id = ? 
+                    WHERE author_id = ?
+                ''', (existing_id, author_id))
+                
+                # Update author_affiliations to use existing ID
+                c.execute('''
+                    INSERT OR IGNORE INTO author_affiliations (author_id, affiliation)
+                    SELECT ?, affiliation
+                    FROM author_affiliations
+                    WHERE author_id = ?
+                ''', (existing_id, author_id))
+                
+                # Delete old author record and their affiliations
+                c.execute('DELETE FROM author_affiliations WHERE author_id = ?', (author_id,))
+                c.execute('DELETE FROM authors WHERE id = ?', (author_id,))
+            else:
+                # Just update the keyname if no existing author found
+                c.execute('''
+                    UPDATE authors
+                    SET keyname = ?
+                    WHERE id = ?
+                ''', (fixed_keyname, author_id))
+        
+        # Cleanup
+        c.execute('DROP TABLE IF EXISTS author_comma_mapping')
+        
+        conn.commit()
+        print("\nChanges committed successfully")
+        
+    except Exception as e:
+        print(f"Error during cleanup: {str(e)}")
+        print("Rolling back changes...")
+        conn.rollback()
+        
+        # Cleanup temporary table
+        c.execute('DROP TABLE IF EXISTS author_comma_mapping')
+        raise
+
+# Run cleanup if needed
+cleanup_author_commas(conn)
 
 # %% [markdown]
 # ## Save Database to Drive

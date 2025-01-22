@@ -229,7 +229,7 @@ class ArxivRecord(Record):
                 keyname_elem = author_elem.find('arxiv:keyname', namespaces=ns)
                 if keyname_elem is None or not keyname_elem.text:
                     continue  # Skip authors without keyname
-                author['keyname'] = keyname_elem.text
+                author['keyname'] = keyname_elem.text.rstrip(',')  # Remove trailing comma if present
                 
                 # Optional author fields
                 forenames_elem = author_elem.find('arxiv:forenames', namespaces=ns)
@@ -261,6 +261,9 @@ def save_papers(papers, conn):
         # Normalize Jr variations
         if suffix.upper() in ['JR', 'JR.', 'JR ', 'JUNIOR']:
             return 'Jr.'
+        # Normalize Sr variations
+        if suffix.upper() in ['SR', 'SR.', 'SR ', 'SENIOR']:
+            return 'Sr.'
         # Normalize roman numerals
         if suffix.upper() in ['I', 'II', 'III', 'IV', 'V']:
             return suffix.upper()
