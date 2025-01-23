@@ -619,10 +619,32 @@ def inspect_papers(conn, limit=5):
     print(f"\nPapers:")
     print(f"Total Papers: {total_papers}")
     
-    # Count cs.AI papers
-    c.execute("SELECT COUNT(*) FROM papers WHERE categories LIKE '%cs.AI%'")
-    ai_papers = c.fetchone()[0]
-    print(f"CS.AI Papers: {ai_papers} ({(ai_papers/total_papers*100):.1f}% of total)")
+    # Withdrawn paper statistics
+    c.execute('SELECT COUNT(*) FROM papers WHERE withdrawn = 1')
+    withdrawn_count = c.fetchone()[0]
+    c.execute('SELECT COUNT(*) FROM papers WHERE withdrawn = 0')
+    active_count = c.fetchone()[0]
+    print(f"Active Papers: {active_count} ({(active_count/total_papers*100):.1f}% of total)")
+    print(f"Withdrawn Papers: {withdrawn_count} ({(withdrawn_count/total_papers*100):.1f}% of total)")
+    
+    # CS Primary papers
+    c.execute('''
+        WITH split_categories AS (
+            SELECT id, withdrawn,
+                   TRIM(SUBSTR(categories, 1, INSTR(categories || ' ', ' ') - 1)) as primary_category
+            FROM papers
+            WHERE categories IS NOT NULL
+        )
+        SELECT 
+            COUNT(*) as total,
+            SUM(CASE WHEN withdrawn = 0 THEN 1 ELSE 0 END) as active
+        FROM split_categories 
+        WHERE primary_category LIKE 'cs.%'
+    ''')
+    cs_stats = c.fetchone()
+    cs_total, cs_active = cs_stats
+    print(f"\nCS primary papers: {cs_total} ({(cs_total/total_papers*100):.1f}% of total)")
+    print(f"Active CS primary papers: {cs_active} ({(cs_active/cs_total*100):.1f}% of CS papers)")
     
     # Category statistics
     print("\nTop Categories:")
@@ -693,30 +715,64 @@ def inspect_papers(conn, limit=5):
         percentage = (present / total_papers) * 100 if total_papers > 0 else 0
         print(f"{field}: {present}/{total_papers} ({percentage:.1f}%)")
 
-    # Add withdrawn paper statistics after paper statistics
-    print("\nWithdrawn Paper Statistics:")
-    c.execute('SELECT COUNT(*) FROM papers WHERE withdrawn = 1')
-    withdrawn_count = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM papers WHERE withdrawn = 0')
-    active_count = c.fetchone()[0]
-    print(f"Active Papers: {active_count} ({(active_count/total_papers*100):.1f}% of total)")
-    print(f"Withdrawn Papers: {withdrawn_count} ({(withdrawn_count/total_papers*100):.1f}% of total)")
+    # Duplicate title analysis
+    def normalize_title(title):
+        """Normalize title for comparison"""
+        if not title:
+            return ""
+        # Convert to lowercase
+        title = title.lower()
+        # Remove version numbers
+        title = re.sub(r'\bv\d+\b', '', title)
+        # Remove arXiv identifiers
+        title = re.sub(r'arxiv:\d+\.\d+', '', title, flags=re.IGNORECASE)
+        # Remove punctuation and normalize whitespace
+        title = re.sub(r'[^\w\s]', '', title)
+        return ' '.join(title.split())
     
-    # Check for papers with "withdrawn" in comments but not marked withdrawn
+    print("\nAnalyzing duplicate titles...")
     c.execute('''
-        SELECT id, title, comments 
-        FROM papers 
-        WHERE comments LIKE '%withdrawn%' AND withdrawn = 0
+        SELECT 
+            p.id,
+            p.title,
+            p.categories,
+            GROUP_CONCAT(a.keyname || COALESCE(', ' || a.forenames, '') || COALESCE(' ' || a.suffix, '')) as authors
+        FROM papers p
+        LEFT JOIN paper_authors pa ON p.id = pa.paper_id
+        LEFT JOIN authors a ON pa.author_id = a.id
+        WHERE p.title IS NOT NULL AND p.withdrawn = 0  -- Only analyze active papers
+        GROUP BY p.id
     ''')
-    potential_withdrawn = c.fetchall()
-    if potential_withdrawn:
-        print(f"\nFound {len(potential_withdrawn)} papers with 'withdrawn' in comments but not marked withdrawn:")
-        for i, paper in enumerate(potential_withdrawn[:5], 1):  # Show up to 5 examples
-            print(f"\n{i}. Paper ID: {paper[0]}")
-            print(f"   Title: {paper[1]}")
-            print(f"   Comments: {paper[2]}")
-    else:
-        print("\nNo papers found with 'withdrawn' in comments but not marked withdrawn")
+    papers = c.fetchall()
+    
+    # Group by normalized title
+    title_groups = {}
+    for paper in papers:
+        norm_title = normalize_title(paper[1])
+        if norm_title in title_groups:
+            title_groups[norm_title].append(paper)
+        else:
+            title_groups[norm_title] = [paper]
+    
+    # Find groups with multiple papers
+    duplicates = {title: papers for title, papers in title_groups.items() if len(papers) > 1}
+    
+    print(f"\nDuplicate Title Analysis (Active Papers Only):")
+    print(f"Found {len(duplicates)} groups of papers with identical normalized titles")
+    total_dupes = sum(len(papers) for papers in duplicates.values())
+    print(f"Total papers involved in duplicates: {total_dupes}")
+    
+    # Print some examples
+    if duplicates:
+        print("\nExample duplicate groups:")
+        for title, group in list(duplicates.items())[:3]:  # Show first 3 groups
+            print(f"\nNormalized Title: {title}")
+            for paper in group:
+                print(f"- ID: {paper[0]}")
+                print(f"  Original Title: {paper[1]}")
+                print(f"  Categories: {paper[2]}")
+                print(f"  Authors: {paper[3]}")
+            print("-" * 80)
 
 # Inspect sample papers
 inspect_papers(conn) 
