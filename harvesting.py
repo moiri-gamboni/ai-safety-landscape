@@ -5,12 +5,25 @@
 # ---
 
 # %% [markdown]
-# # AI Safety Papers Visualization - Phase 1
+# # arXiv Computer Science Papers Database
 #
-# This notebook implements Phase 1 of the AI Safety Papers visualization project:
-# 1. Metadata Collection using arXiv OAI-PMH API
-# 2. Abstract Embedding Generation using ModernBERT-large
-# 3. Initial Clustering using UMAP and HDBSCAN
+# This notebook creates and maintains a SQLite database of Computer Science papers from arXiv. It:
+# 1. Harvests metadata using arXiv's OAI-PMH API
+# 2. Stores paper metadata, versions, and author information
+# 3. Provides data quality analysis and management tools
+#
+# The database schema includes:
+# - Papers: Core metadata (title, abstract, categories, etc.)
+# - Paper Versions: Version history and submission dates
+# - Authors: Normalized author information
+# - Paper-Author relationships: Author order in papers
+
+# %% [markdown]
+# # 1. Database Setup and Initialization
+
+# %% [markdown]
+# ## 1.1 Environment Setup
+# Run this cell to set up the environment if using Google Colab.
 
 # %%
 # Clone repository if running in Colab
@@ -24,33 +37,58 @@ if 'COLAB_GPU' in os.environ:
 %pip install -r requirements.txt
 
 # %% [markdown]
-# ## Load Existing Database
+# ## 1.2 Database Initialization
+# Choose whether to load an existing database from Google Drive or create a new one.
 
 # %%
+# @title Database Initialization Choice
+db_choice = "create_new" # @param ["create_new", "load_existing"] {type:"string", label:"Database Choice"}
+
 import sqlite3
 import os
 
-# Mount Google Drive
-from google.colab import drive
-drive.mount('/content/drive')
+def load_existing_database():
+    """Load existing database from Google Drive"""
+    # Mount Google Drive
+    from google.colab import drive
+    drive.mount('/content/drive')
 
-# Check if database exists in Drive
-db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
-if os.path.exists(db_path):
+    # Check if database exists in Drive
+    db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"No database found at {db_path}")
+        
     print(f"Found existing database at {db_path}")
     !cp "{db_path}" papers.db
     
-    # Print existing data summary
+    # Connect and print summary
     conn = sqlite3.connect('papers.db')
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM papers')
     print(f"Database contains {c.fetchone()[0]} papers")
-else:
-    print("No existing database found in Drive. Will create new one.")
+    return conn
 
+def create_new_database():
+    """Create a new empty database with schema"""
+    if os.path.exists('papers.db'):
+        print("Warning: Overwriting existing local database")
+    
+    print("Creating new database...")
+    conn = create_database()
+    print("Database created successfully")
+    return conn
+
+# Initialize database based on user choice
+if db_choice == "create_new":
+    print("Creating new database...")
+    conn = create_new_database()
+else:
+    print("Loading existing database...")
+    conn = load_existing_database()
 
 # %% [markdown]
-# ## Create Database
+# ### 1.2.1 Database Schema
+# This shows the schema used for both new and existing databases.
 
 # %%
 import sqlite3
@@ -134,16 +172,28 @@ def create_database():
 conn = create_database()
 
 # %% [markdown]
-# ## Harvest Metadata
+# # 2. Data Collection
+
+# %% [markdown]
+# ## 2.1 Harvesting Configuration
+# Configure the number of papers to fetch and provide a resumption token if continuing an interrupted harvest.
 #
-# ### Configuration
-# - **Number of Papers**: Control how many papers to fetch. Set to 0 to fetch all CS papers (warning: this will take a long time).
-# - **Resumption Token**: If harvesting was interrupted, paste the resumption token here to continue from where you left off.
-#   You can paste the full URL or just the token - URL-encoded characters (like %7C) will be automatically converted.
+# ### Number of Papers
+# - Set to 0 to fetch all CS papers (warning: this will take several hours)
+# - Set to a specific number (e.g., 100) to test the harvesting process
+#
+# ### Resumption Token
+# If harvesting was interrupted (e.g., due to timeout or error), you can continue from where you left off:
+# 1. Copy the resumption token from the error message or last output
+# 2. Paste it below to resume harvesting from that point
+# 3. You can paste either:
+#    - The full URL (e.g., `http://export.arxiv.org/oai2?verb=ListRecords&resumptionToken=foo%7Cbar`)
+#    - Just the token part (e.g., `foo|bar`)
+#    - URL-encoded characters (like %7C) will be automatically converted
 
 # %%
 # @title Harvesting Configuration  {"run":"auto"}
-num_papers = 100 # @param {type:"slider", min:0, max:10000, step:100}
+num_papers = 0 # @param {type:"slider", min:0, max:10000, step:100}
 resumption_token = "" # @param {type:"string"}
 
 # %%
@@ -528,9 +578,9 @@ def fetch_raw_metadata(max_results=None, resumption_token=None):
     return fetch_arxiv_records('arXivRaw', ArxivRawRecord, max_results, resumption_token)
 
 # %% [markdown]
-# ## Harvest arXiv Metadata
-# This cell fetches the main metadata (titles, abstracts, authors, etc.) from arXiv's OAI-PMH API.
-# You can run this cell independently and save the database before proceeding to raw metadata harvesting.
+# ## 2.2 Core Metadata Collection
+# Fetches primary metadata (titles, abstracts, authors) using arXiv's OAI-PMH API.
+# You can run this section independently and save before proceeding to version metadata.
 
 # %%
 # Fetch papers using the slider value (None for all papers)
@@ -555,11 +605,9 @@ print(f"- Papers added this session: {final_count - current_count}")
 print(f"- Total papers in database: {final_count}")
 
 # %% [markdown]
-# ## Harvest arXiv Raw Metadata
-# This cell fetches additional metadata about paper versions from arXiv's OAI-PMH API using the arXivRaw format.
-# You can run this cell separately after running the main metadata harvesting above.
-# 
-# **Note**: Make sure to run the database loading cell first if you're running this in a new session.
+# ## 2.3 Version Metadata Collection
+# Fetches additional metadata about paper versions using arXiv's OAI-PMH API with arXivRaw format.
+# **Note**: Run this after collecting core metadata, and ensure database is loaded if in a new session.
 
 # %%
 # Fetch version information with arXivRaw
@@ -580,7 +628,16 @@ print(f"- Total versions stored: {version_count}")
 print(f"- Papers with version info: {papers_with_versions}")
 
 # %% [markdown]
-# ## Data Quality Check
+# # 3. Data Quality and Management
+
+# %% [markdown]
+# ## 3.1 Quality Check
+# Performs comprehensive analysis of the collected data, including:
+# - Sample paper inspection
+# - Coverage statistics
+# - Author statistics
+# - Category distribution
+# - Duplicate detection
 
 # %%
 def inspect_papers(conn, limit=5):
@@ -780,7 +837,8 @@ def inspect_papers(conn, limit=5):
 inspect_papers(conn) 
 
 # %% [markdown]
-# ## Save Database to Drive
+# ## 3.2 Database Backup
+# Saves the database to Google Drive for persistence.
 
 # %%
 # Mount Google Drive
@@ -795,9 +853,9 @@ drive.mount('/content/drive')
 print("Database saved to Google Drive at: /ai-safety-papers/papers.db")
 
 # %% [markdown]
-# ## Database Cleanup
-# Use this cell if harvesting was interrupted and you need to clean up and retry with the data in memory.
-# Only run this if you still have the `initial_papers` variable in memory from a previous interrupted run.
+# ## 3.3 Database Recovery
+# Use this section if harvesting was interrupted and you need to clean up and retry with data in memory.
+# **Important**: Only run if you have the `initial_papers` variable from a previous interrupted run.
 
 # %%
 # Drop all tables in correct order (respecting foreign key constraints)
