@@ -124,6 +124,8 @@ def create_database():
     c.execute("CREATE INDEX IF NOT EXISTS idx_categories ON papers(categories)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_withdrawn ON papers(withdrawn)")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_authors_unique ON authors(keyname, forenames, suffix)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_created ON papers(created)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_updated ON papers(updated)")
     
     conn.commit()
     return conn
