@@ -56,31 +56,6 @@ else:
 import sqlite3
 import os
 
-def get_sqlite_variable_limit(conn):
-    """Get the maximum number of variables allowed in a SQLite query"""
-    c = conn.cursor()
-    c.execute('PRAGMA compile_options')
-    compile_options = c.fetchall()
-    for option in compile_options:
-        if 'MAX_VARIABLE_NUMBER=' in option[0]:
-            return int(option[0].split('=')[1])
-    return 999  # Default SQLite limit if not found
-
-def get_safe_batch_size(conn, vars_per_item=1):
-    """Calculate a safe batch size based on SQLite's variable limit
-    
-    Args:
-        conn: SQLite connection
-        vars_per_item: Number of variables needed per item in a batch
-        
-    Returns:
-        int: Safe batch size that won't exceed SQLite's variable limit
-    """
-    max_vars = get_sqlite_variable_limit(conn)
-    # Use 90% of the limit to be safe
-    safe_vars = int(max_vars * 0.9)
-    return safe_vars // vars_per_item
-
 def create_database():
     """Create SQLite database with necessary tables"""
     conn = sqlite3.connect('papers.db')
@@ -175,6 +150,31 @@ from sickle.models import Record
 from tqdm import tqdm
 import urllib.parse
 import re
+
+def get_sqlite_variable_limit(conn):
+    """Get the maximum number of variables allowed in a SQLite query"""
+    c = conn.cursor()
+    c.execute('PRAGMA compile_options')
+    compile_options = c.fetchall()
+    for option in compile_options:
+        if 'MAX_VARIABLE_NUMBER=' in option[0]:
+            return int(option[0].split('=')[1])
+    return 999  # Default SQLite limit if not found
+
+def get_safe_batch_size(conn, vars_per_item=1):
+    """Calculate a safe batch size based on SQLite's variable limit
+    
+    Args:
+        conn: SQLite connection
+        vars_per_item: Number of variables needed per item in a batch
+        
+    Returns:
+        int: Safe batch size that won't exceed SQLite's variable limit
+    """
+    max_vars = get_sqlite_variable_limit(conn)
+    # Use 90% of the limit to be safe
+    safe_vars = int(max_vars * 0.9)
+    return safe_vars // vars_per_item
 
 class ArxivRecord(Record):
     """Custom record class for arXiv metadata format"""
@@ -392,8 +392,15 @@ def save_versions(paper_versions, conn):
     paper_updates = []
     version_inserts = []
     
+    # Group versions by paper ID
+    paper_version_map = {}
+    for paper in paper_versions:
+        paper_id = paper['id']
+        if 'versions' in paper:
+            paper_version_map[paper_id] = paper['versions']
+    
     # Collect all data first
-    for paper_id, versions in paper_versions.items():
+    for paper_id, versions in paper_version_map.items():
         # Sort versions by version number
         versions = sorted(versions, key=lambda x: x['version'])
         
