@@ -307,15 +307,7 @@ finally:
     print(f"- Total papers processed: {total_updated}")
 
 # %% [markdown]
-# ## 5. Database Backup
-
-# %%
-# Copy updated database back to Drive
-!cp {local_db} "{db_path}"
-print("Database backup completed to Google Drive")
-
-# %% [markdown]
-# ## 6. Data Quality Validation
+# ## 5. Data Quality Validation
 
 # %%
 import numpy as np
@@ -431,3 +423,11 @@ def validate_embeddings(conn):
 
 # Run validation
 validate_embeddings(conn)
+
+# %% [markdown]
+# ## 6. Database Backup
+
+# %%
+# Copy updated database back to Drive
+!cp {local_db} "{db_path}"
+print("Database backup completed to Google Drive")
