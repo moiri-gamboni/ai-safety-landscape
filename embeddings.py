@@ -130,94 +130,181 @@ def generate_embeddings(
         
         return embeddings.cpu().numpy().astype(np.float32)
 
-def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 256):
-    """Generator that yields batches of papers with cs.AI in their categories"""
+def get_csai_papers(conn: sqlite3.Connection, batch_size_ref: dict):
+    """Generator that yields batches of papers with cs.AI in their categories
+    
+    Args:
+        conn: Database connection
+        batch_size_ref: Dictionary containing current batch size, allows for dynamic updates
+    """
     cursor = conn.cursor()
+    
+    # First get total count for progress bar
     cursor.execute('''
-        SELECT id, abstract 
-        FROM papers 
-        WHERE categories LIKE '%cs.AI%' 
-          AND abstract IS NOT NULL
-          AND abstract_embedding IS NULL
+        WITH split_categories AS (
+            SELECT id, abstract
+            FROM papers
+            WHERE categories LIKE '%cs.AI%'
+              AND abstract IS NOT NULL
+              AND abstract_embedding IS NULL
+        )
+        SELECT COUNT(*) FROM split_categories
+    ''')
+    total_papers = cursor.fetchone()[0]
+    
+    # Then fetch papers in batches
+    cursor.execute('''
+        WITH split_categories AS (
+            SELECT id, abstract
+            FROM papers
+            WHERE categories LIKE '%cs.AI%'
+              AND abstract IS NOT NULL
+              AND abstract_embedding IS NULL
+        )
+        SELECT id, abstract FROM split_categories
     ''')
     
     batch = []
-    for row in cursor:
-        batch.append((row['id'], row['abstract']))
-        if len(batch) >= batch_size:
+    with tqdm(total=total_papers, desc="Processing papers", unit=" papers") as pbar:
+        for row in cursor:
+            batch.append((row['id'], row['abstract']))
+            if len(batch) >= batch_size_ref['size']:
+                pbar.update(len(batch))
+                yield batch
+                batch = []
+                # Clear CUDA cache after each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        if batch:
+            pbar.update(len(batch))
             yield batch
-            batch = []
-    if batch:
-        yield batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-# %%
+def get_gpu_memory_free():
+    """Get actual free GPU memory in GB, accounting for all reserved memory"""
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        reserved = torch.cuda.max_memory_reserved() / 1024**3
+        return total - reserved
+    return 0
+
+def get_gpu_memory_stats():
+    """Get GPU memory statistics in GB"""
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        reserved = torch.cuda.max_memory_reserved() / 1024**3
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        cached = torch.cuda.memory_reserved() / 1024**3
+        return {
+            'total': total,
+            'reserved': reserved,
+            'allocated': allocated,
+            'cached': cached,
+            'free_total': total - reserved,
+            'free_cached': cached - allocated
+        }
+    return None
+
+def calculate_batch_adjustment(current_size: int, peak_memory: float) -> Optional[int]:
+    """Calculate new batch size based on memory usage.
+    
+    Args:
+        current_size: Current batch size
+        peak_memory: Peak memory used by current batch in GB
+        
+    Returns:
+        Optional[int]: New batch size if adjustment needed, None otherwise
+    """
+    stats = get_gpu_memory_stats()
+    if not stats:
+        return None
+        
+    # How many times our current batch could fit in memory (leaving 2GB buffer)
+    memory_headroom = (stats['total'] - 2.0) / peak_memory if peak_memory > 0 else 1
+    
+    # Target range: 1.2-1.4x headroom
+    if memory_headroom > 1.4:  # Using too little memory
+        # Increase batch size to target 1.3x headroom
+        increase_factor = min(memory_headroom / 1.3, 1.3)
+        return int(current_size * increase_factor)
+    elif memory_headroom < 1.2:  # Using too much memory
+        # Reduce batch size to target 1.3x headroom
+        decrease_factor = 1.3 / memory_headroom
+        return int(current_size / decrease_factor)
+    return None  # We're in the optimal range
+
 # Process in batches
 total_updated = 0
-batch_size = 256  # Adjust based on GPU memory
-
-# Get total number of papers to process
-cursor = conn.cursor()
-cursor.execute('''
-    SELECT COUNT(*) as count
-    FROM papers 
-    WHERE categories LIKE '%cs.AI%' 
-      AND abstract IS NOT NULL
-      AND abstract_embedding IS NULL
-''')
-total_papers = cursor.fetchone()['count']
-total_batches = (total_papers + batch_size - 1) // batch_size  # Ceiling division
+batch_size_ref = {'size': 256}  # Mutable reference to batch size
 
 try:
-    for batch_num, batch in enumerate(tqdm(get_csai_papers(conn, batch_size), 
-                                         desc="Processing batches",
-                                         total=total_batches), 1):
-        paper_ids = [item[0] for item in batch]
-        abstracts = [item[1] for item in batch]
-        
+    while True:  # Keep trying until we succeed or hit an unrecoverable error
         try:
-            # Generate embeddings with mean pooling and normalization
-            embeddings = generate_embeddings(
-                abstracts,
-                pooling="mean",  # Better for document similarity
-                normalize=True   # Better for clustering
-            )
+            for batch in get_csai_papers(conn, batch_size_ref):
+                # Reset peak stats before processing
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                
+                paper_ids = [item[0] for item in batch]
+                abstracts = [item[1] for item in batch]
+                
+                # Generate embeddings with mean pooling and normalization
+                embeddings = generate_embeddings(
+                    abstracts,
+                    pooling="mean",  # Better for document similarity
+                    normalize=True   # Better for clustering
+                )
+                
+                # Calculate actual memory used by this batch
+                peak_memory = torch.cuda.max_memory_allocated() / 1024**3  # GB
+                
+                # Store in database
+                cursor = conn.cursor()
+                for paper_id, embedding in zip(paper_ids, embeddings):
+                    embedding_blob = embedding.tobytes()
+                    cursor.execute('''
+                        UPDATE papers
+                        SET abstract_embedding = ?
+                        WHERE id = ?
+                    ''', (embedding_blob, paper_id))
+                
+                conn.commit()
+                total_updated += len(batch)
+                
+                # Check if we should adjust batch size
+                new_size = calculate_batch_adjustment(batch_size_ref['size'], peak_memory)
+                if new_size:
+                    old_size = batch_size_ref['size']
+                    batch_size_ref['size'] = new_size
+                    print(f"\nAdjusting batch size: {old_size} → {new_size} (peak memory: {peak_memory:.1f}GB)")
+                
+                # Clear CUDA cache after each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
             
-            # Store in database
-            cursor = conn.cursor()
-            for paper_id, embedding in zip(paper_ids, embeddings):
-                embedding_blob = embedding.tobytes()
-                cursor.execute('''
-                    UPDATE papers
-                    SET abstract_embedding = ?
-                    WHERE id = ?
-                ''', (embedding_blob, paper_id))
+            # If we complete the loop without OOM errors, we're done
+            break
             
-            conn.commit()
-            total_updated += len(batch)
-            print(f"\nBatch {batch_num}/{total_batches} complete:")
-            print(f"- Papers processed this batch: {len(batch)}")
-            print(f"- Total papers processed: {total_updated}/{total_papers} ({(total_updated/total_papers)*100:.1f}%)")
-            
-        except Exception as e:
-            print(f"\nError processing batch {batch_num}/{total_batches}:")
-            print(f"- Error message: {str(e)}")
-            print(f"- Batch size: {len(batch)}")
-            conn.rollback()
-            # Optionally reduce batch size and retry
-            if batch_size > 32:
-                print("- Reducing batch size and continuing...")
-                batch_size = batch_size // 2
-                # Recalculate total batches with new batch size
-                total_batches = (total_papers - total_updated + batch_size - 1) // batch_size
-            else:
-                raise  # Re-raise if batch size is already small
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                old_size = batch_size_ref['size']
+                # Reduce by 20%
+                batch_size_ref['size'] = int(old_size * 0.8)
+                print(f"\nCUDA out of memory - reducing batch size: {old_size} → {batch_size_ref['size']}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                continue
+            raise  # Re-raise if it's not an OOM error
 
 except Exception as e:
     print(f"\nFatal error in embedding generation: {str(e)}")
     raise
 finally:
     print(f"\nProcess completed:")
-    print(f"- Total papers processed: {total_updated}/{total_papers} ({(total_updated/total_papers)*100:.1f}%)")
+    print(f"- Total papers processed: {total_updated}")
 
 # %% [markdown]
 # ## 5. Database Backup
