@@ -40,6 +40,7 @@ db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
 local_db = "papers.db"
 
 # Copy database to local storage if needed
+print(f"Copying database to local storage: {local_db}")
 if not os.path.exists(local_db):
     %cp "{db_path}" {local_db}
 
@@ -73,7 +74,8 @@ MODEL_NAME = "answerdotai/ModernBERT-large"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.float16,
+    attn_implementation="eager"  # Use standard attention implementation for broader compatibility
 ).to(device)
 model.eval()
 
@@ -129,12 +131,12 @@ def generate_embeddings(
         return embeddings.cpu().numpy().astype(np.float32)
 
 def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 256):
-    """Generator that yields batches of CS.AI papers with abstracts"""
+    """Generator that yields batches of papers with cs.AI in their categories"""
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, abstract 
         FROM papers 
-        WHERE categories LIKE 'cs.AI%' 
+        WHERE categories LIKE '%cs.AI%' 
           AND abstract IS NOT NULL
           AND abstract_embedding IS NULL
     ''')
@@ -153,37 +155,69 @@ def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 256):
 total_updated = 0
 batch_size = 256  # Adjust based on GPU memory
 
-for batch in tqdm(get_csai_papers(conn, batch_size), desc="Processing batches"):
-    paper_ids = [item[0] for item in batch]
-    abstracts = [item[1] for item in batch]
-    
-    try:
-        # Generate embeddings with mean pooling and normalization
-        embeddings = generate_embeddings(
-            abstracts,
-            pooling="mean",  # Better for document similarity
-            normalize=True   # Better for clustering
-        )
-        
-        # Store in database
-        cursor = conn.cursor()
-        for paper_id, embedding in zip(paper_ids, embeddings):
-            embedding_blob = embedding.tobytes()
-            cursor.execute('''
-                UPDATE papers
-                SET abstract_embedding = ?
-                WHERE id = ?
-            ''', (embedding_blob, paper_id))
-        
-        conn.commit()
-        total_updated += len(batch)
-        print(f"Processed {total_updated} papers", end='\r')
-        
-    except Exception as e:
-        print(f"\nError processing batch: {str(e)}")
-        conn.rollback()
+# Get total number of papers to process
+cursor = conn.cursor()
+cursor.execute('''
+    SELECT COUNT(*) as count
+    FROM papers 
+    WHERE categories LIKE '%cs.AI%' 
+      AND abstract IS NOT NULL
+      AND abstract_embedding IS NULL
+''')
+total_papers = cursor.fetchone()['count']
+total_batches = (total_papers + batch_size - 1) // batch_size  # Ceiling division
 
-print(f"\nCompleted! Total papers updated: {total_updated}")
+try:
+    for batch_num, batch in enumerate(tqdm(get_csai_papers(conn, batch_size), 
+                                         desc="Processing batches",
+                                         total=total_batches), 1):
+        paper_ids = [item[0] for item in batch]
+        abstracts = [item[1] for item in batch]
+        
+        try:
+            # Generate embeddings with mean pooling and normalization
+            embeddings = generate_embeddings(
+                abstracts,
+                pooling="mean",  # Better for document similarity
+                normalize=True   # Better for clustering
+            )
+            
+            # Store in database
+            cursor = conn.cursor()
+            for paper_id, embedding in zip(paper_ids, embeddings):
+                embedding_blob = embedding.tobytes()
+                cursor.execute('''
+                    UPDATE papers
+                    SET abstract_embedding = ?
+                    WHERE id = ?
+                ''', (embedding_blob, paper_id))
+            
+            conn.commit()
+            total_updated += len(batch)
+            print(f"\nBatch {batch_num}/{total_batches} complete:")
+            print(f"- Papers processed this batch: {len(batch)}")
+            print(f"- Total papers processed: {total_updated}/{total_papers} ({(total_updated/total_papers)*100:.1f}%)")
+            
+        except Exception as e:
+            print(f"\nError processing batch {batch_num}/{total_batches}:")
+            print(f"- Error message: {str(e)}")
+            print(f"- Batch size: {len(batch)}")
+            conn.rollback()
+            # Optionally reduce batch size and retry
+            if batch_size > 32:
+                print("- Reducing batch size and continuing...")
+                batch_size = batch_size // 2
+                # Recalculate total batches with new batch size
+                total_batches = (total_papers - total_updated + batch_size - 1) // batch_size
+            else:
+                raise  # Re-raise if batch size is already small
+
+except Exception as e:
+    print(f"\nFatal error in embedding generation: {str(e)}")
+    raise
+finally:
+    print(f"\nProcess completed:")
+    print(f"- Total papers processed: {total_updated}/{total_papers} ({(total_updated/total_papers)*100:.1f}%)")
 
 # %% [markdown]
 # ## 5. Database Backup

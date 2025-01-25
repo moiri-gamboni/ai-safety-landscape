@@ -5,6 +5,6 @@ sickle
 pre-commit
 jupytext
 transformers>=4.48.0
-flash-attn
+# flash-attn
 numpy
 scikit-learn
