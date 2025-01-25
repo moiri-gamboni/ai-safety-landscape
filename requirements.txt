@@ -4,3 +4,7 @@ ipykernel
 sickle
 pre-commit
 jupytext
+transformers>=4.48.0
+flash-attn
+numpy
+scikit-learn
