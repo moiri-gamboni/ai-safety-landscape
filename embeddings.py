@@ -315,6 +315,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 def validate_embeddings(conn):
     """Run quality checks on generated embeddings"""
+    # Set fixed seeds for reproducibility
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+    torch.manual_seed(42)
+    
     cursor = conn.cursor()
     
     print("\n=== Embedding Quality Checks ===")
@@ -326,7 +332,7 @@ def validate_embeddings(conn):
             SUM(CASE WHEN abstract_embedding IS NOT NULL THEN 1 ELSE 0 END) AS with_embedding,
             SUM(CASE WHEN abstract_embedding IS NULL THEN 1 ELSE 0 END) AS without_embedding
         FROM papers 
-        WHERE categories LIKE 'cs.AI%'
+        WHERE categories LIKE '%cs.AI%'
           AND abstract IS NOT NULL
     ''')
     stats = cursor.fetchone()
@@ -340,7 +346,6 @@ def validate_embeddings(conn):
         SELECT abstract_embedding 
         FROM papers 
         WHERE abstract_embedding IS NOT NULL
-        LIMIT 1000
     ''')
     invalid_count = 0
     total_checked = 0
@@ -360,8 +365,6 @@ def validate_embeddings(conn):
         SELECT abstract_embedding 
         FROM papers 
         WHERE abstract_embedding IS NOT NULL
-        ORDER BY RANDOM()
-        LIMIT 1000
     ''')
     norms = []
     for row in cursor:
@@ -373,53 +376,139 @@ def validate_embeddings(conn):
     print(f"- Std dev: {np.std(norms):.2f}")
     print(f"- Min/Max: {np.min(norms):.2f}/{np.max(norms):.2f}")
 
-    # 4. Similarity Sanity Check
-    # Get random pairs
+    # 4. Similarity Analysis
+    # Get random pairs more efficiently
     cursor.execute('''
-        SELECT abstract_embedding 
+        SELECT id, title, abstract, abstract_embedding 
         FROM papers 
         WHERE abstract_embedding IS NOT NULL
-        ORDER BY RANDOM()
-        LIMIT 100
+          AND categories LIKE '%cs.AI%'
+          AND ABS(RANDOM() % 100) = 0  -- Fast random sampling
+        LIMIT 10000
     ''')
-    random_embeddings = [np.frombuffer(row['abstract_embedding'], dtype=np.float32) for row in cursor]
-    random_similarities = cosine_similarity(random_embeddings)
-    np.fill_diagonal(random_similarities, np.nan)  # Exclude self-similarity
+    papers = cursor.fetchall()
+    random_embeddings = np.vstack([np.frombuffer(row['abstract_embedding'], dtype=np.float32) for row in papers])
     
-    # Get duplicate candidates (from harvesting phase)
-    cursor.execute('''
-        SELECT p1.abstract_embedding, p2.abstract_embedding
-        FROM (
-            SELECT id, title
-            FROM papers
-            WHERE withdrawn = 0
-        ) p1
-        JOIN (
-            SELECT id, title
-            FROM papers
-            WHERE withdrawn = 0
-        ) p2 ON p1.title COLLATE NOCASE = p2.title COLLATE NOCASE AND p1.id < p2.id
-        WHERE p1.abstract_embedding IS NOT NULL
-          AND p2.abstract_embedding IS NOT NULL
-        LIMIT 50
-    ''')
-    duplicate_pairs = []
-    for row in cursor:
-        e1 = np.frombuffer(row[0], dtype=np.float32)
-        e2 = np.frombuffer(row[1], dtype=np.float32)
-        duplicate_pairs.append((e1, e2))
+    # Analyze embedding components
+    print("\n4. Embedding Analysis:")
+    print(f"- Shape: {random_embeddings.shape}")
+    print("- Component statistics:")
+    means = np.mean(random_embeddings, axis=0)
+    stds = np.std(random_embeddings, axis=0)
+    print(f"  Mean of means: {np.mean(means):.3f} ± {np.std(means):.3f}")
+    print(f"  Mean of stds: {np.mean(stds):.3f} ± {np.std(stds):.3f}")
+    print(f"  Component range: [{np.min(random_embeddings):.3f}, {np.max(random_embeddings):.3f}]")
     
-    # Calculate similarities
-    duplicate_similarities = [cosine_similarity([e1], [e2])[0][0] for e1, e2 in duplicate_pairs]
+    # Show distribution of components
+    positive_frac = np.mean(random_embeddings > 0)
+    print(f"  Fraction of positive components: {positive_frac:.3f}")
     
-    print(f"\n4. Similarity Analysis:")
-    print(f"- Random pairs (n={len(random_similarities)**2 - len(random_similarities)}):")
-    print(f"  Mean: {np.nanmean(random_similarities):.2f} ± {np.nanstd(random_similarities):.2f}")
-    if duplicate_pairs:
-        print(f"- Duplicate candidates (n={len(duplicate_pairs)}):")
-        print(f"  Mean: {np.mean(duplicate_similarities):.2f} ± {np.std(duplicate_similarities):.2f}")
+    # Compute similarities
+    n_samples = len(random_embeddings)
+    if n_samples > 1:
+        # Generate random pairs of indices
+        idx1 = np.random.randint(0, n_samples, size=1000)
+        idx2 = np.random.randint(0, n_samples, size=1000)
+        # Exclude self-pairs
+        valid_pairs = idx1 != idx2
+        idx1, idx2 = idx1[valid_pairs], idx2[valid_pairs]
+        
+        # Compute cosine similarities properly
+        similarities = cosine_similarity(random_embeddings[idx1], random_embeddings[idx2]).diagonal()
+        
+        print("\n5. Similarity Analysis:")
+        print(f"- Random pairs (n={len(similarities)}):")
+        print(f"  Mean: {np.mean(similarities):.3f} ± {np.std(similarities):.3f}")
+        print(f"  Range: [{np.min(similarities):.3f}, {np.max(similarities):.3f}]")
+        
+        # Print example pairs with different similarity levels
+        print("\nExample pairs:")
+        # Most similar pair
+        most_similar_idx = np.argmax(similarities)
+        print(f"\nMost similar pair (similarity: {similarities[most_similar_idx]:.3f}):")
+        print(f"Paper 1: {papers[idx1[most_similar_idx]]['title']}")
+        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[most_similar_idx]]['id']}")
+        print(f"Abstract 1:\n{papers[idx1[most_similar_idx]]['abstract']}")
+        print(f"\nPaper 2: {papers[idx2[most_similar_idx]]['title']}")
+        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[most_similar_idx]]['id']}")
+        print(f"Abstract 2:\n{papers[idx2[most_similar_idx]]['abstract']}")
+        
+        # Least similar pair
+        least_similar_idx = np.argmin(similarities)
+        print(f"\nLeast similar pair (similarity: {similarities[least_similar_idx]:.3f}):")
+        print(f"Paper 1: {papers[idx1[least_similar_idx]]['title']}")
+        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[least_similar_idx]]['id']}")
+        print(f"Abstract 1:\n{papers[idx1[least_similar_idx]]['abstract']}")
+        print(f"\nPaper 2: {papers[idx2[least_similar_idx]]['title']}")
+        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[least_similar_idx]]['id']}")
+        print(f"Abstract 2:\n{papers[idx2[least_similar_idx]]['abstract']}")
+        
+        # Median similarity pair
+        median_idx = np.argsort(similarities)[len(similarities)//2]
+        print(f"\nMedian similarity pair (similarity: {similarities[median_idx]:.3f}):")
+        print(f"Paper 1: {papers[idx1[median_idx]]['title']}")
+        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[median_idx]]['id']}")
+        print(f"Abstract 1:\n{papers[idx1[median_idx]]['abstract']}")
+        print(f"\nPaper 2: {papers[idx2[median_idx]]['title']}")
+        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[median_idx]]['id']}")
+        print(f"Abstract 2:\n{papers[idx2[median_idx]]['abstract']}")
     else:
-        print("- No duplicate pairs found for comparison")
+        print("\n5. Similarity Analysis:")
+        print("Not enough samples for similarity analysis")
+    
+    # # Get potential duplicates (papers with same title)
+    # cursor.execute('''
+    #     SELECT p1.id as id1, p2.id as id2,
+    #            p1.title as title1,
+    #            p1.abstract as abstract1,
+    #            p2.abstract as abstract2,
+    #            p1.abstract_embedding as e1,
+    #            p2.abstract_embedding as e2
+    #     FROM papers p1
+    #     JOIN papers p2 ON LOWER(TRIM(p1.title)) = LOWER(TRIM(p2.title))
+    #     WHERE p1.id < p2.id  -- Avoid self-joins and duplicates
+    #       AND p1.withdrawn = 0 AND p2.withdrawn = 0
+    #       AND p1.abstract_embedding IS NOT NULL
+    #       AND p2.abstract_embedding IS NOT NULL
+    #       AND p1.categories LIKE '%cs.AI%'
+    #       AND p2.categories LIKE '%cs.AI%'
+    #     LIMIT 50
+    # ''')
+    
+    # rows = cursor.fetchall()
+    # if rows:
+    #     # Process all pairs at once
+    #     e1 = np.vstack([np.frombuffer(row['e1'], dtype=np.float32) for row in rows])
+    #     e2 = np.vstack([np.frombuffer(row['e2'], dtype=np.float32) for row in rows])
+    #     similarities = np.sum(e1 * e2, axis=1)
+        
+    #     print(f"\n6. Same-title Analysis:")
+    #     print(f"- Same-title pairs (n={len(similarities)}):")
+    #     print(f"  Mean: {np.mean(similarities):.3f} ± {np.std(similarities):.3f}")
+    #     print(f"  Range: [{np.min(similarities):.3f}, {np.max(similarities):.3f}]")
+        
+    #     # Print example same-title pairs
+    #     print("\nExample same-title pairs:")
+    #     # Most similar pair
+    #     most_similar_idx = np.argmax(similarities)
+    #     print(f"\nMost similar pair (similarity: {similarities[most_similar_idx]:.3f}):")
+    #     print(f"Title: {rows[most_similar_idx]['title1']}")
+    #     print(f"URL 1: https://arxiv.org/abs/{rows[most_similar_idx]['id1']}")
+    #     print(f"Abstract 1:\n{rows[most_similar_idx]['abstract1']}")
+    #     print(f"\nURL 2: https://arxiv.org/abs/{rows[most_similar_idx]['id2']}")
+    #     print(f"Abstract 2:\n{rows[most_similar_idx]['abstract2']}")
+        
+    #     # Least similar pair
+    #     least_similar_idx = np.argmin(similarities)
+    #     print(f"\nLeast similar pair (similarity: {similarities[least_similar_idx]:.3f}):")
+    #     print(f"Title: {rows[least_similar_idx]['title1']}")
+    #     print(f"URL 1: https://arxiv.org/abs/{rows[least_similar_idx]['id1']}")
+    #     print(f"Abstract 1:\n{rows[least_similar_idx]['abstract1']}")
+    #     print(f"\nURL 2: https://arxiv.org/abs/{rows[least_similar_idx]['id2']}")
+    #     print(f"Abstract 2:\n{rows[least_similar_idx]['abstract2']}")
+    # else:
+    #     print("\n6. Same-title Analysis:")
+    #     print("No same-title pairs found for comparison")
 
 # Run validation
 validate_embeddings(conn)
