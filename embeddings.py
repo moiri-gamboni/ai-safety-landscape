@@ -1,7 +1,7 @@
 # %% [markdown]
 # # AI Safety Papers - Abstract Embedding Phase
 # 
-# This notebook generates ModernBERT embeddings for paper abstracts and stores them in the database.
+# This notebook generates Voyage AI embeddings for paper abstracts and stores them in the database.
 
 # %% [markdown]
 # ## 1. Environment Setup
@@ -21,11 +21,6 @@ if 'COLAB_GPU' in os.environ:
 # Install required packages
 %pip install -r requirements.txt
 
-# Verify GPU availability
-import torch
-print(f"GPU available: {torch.cuda.is_available()}")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # %% [markdown]
 # ## 2. Database Connection
 
@@ -34,6 +29,25 @@ import sqlite3
 import os
 import numpy as np
 from tqdm import tqdm
+import voyageai
+from dotenv import load_dotenv
+from sklearn.metrics.pairwise import cosine_similarity
+import time
+from typing import List, Tuple, Optional
+
+# Load API key - try Colab form first, then .env
+if 'COLAB_GPU' in os.environ:
+    print("Getting Voyage AI API key from Colab form")
+    # @title Voyage AI API Key
+    voyage_api_key = "" # @param {type:"string"}
+    # Set it for the client
+    voyageai.api_key = voyage_api_key
+else:
+    print("Running locally, loading API key from .env")
+    load_dotenv()
+
+# Initialize Voyage AI client
+vo = voyageai.Client()
 
 # Path to database
 db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
@@ -47,7 +61,7 @@ if not os.path.exists(local_db):
 conn = sqlite3.connect(local_db)
 conn.row_factory = sqlite3.Row
 
-# Check if abstract_embedding column exists
+# Check if abstract_embedding and token_count columns exist
 cursor = conn.cursor()
 cursor.execute("PRAGMA table_info(papers)")
 columns = [column[1] for column in cursor.fetchall()]
@@ -60,82 +74,78 @@ if 'abstract_embedding' not in columns:
     ''')
     conn.commit()
 
-# %% [markdown]
-# ## 3. Model Initialization
-
-# %%
-from transformers import AutoTokenizer, AutoModel
-from typing import List, Optional
-import torch.nn.functional as F
-
-MODEL_NAME = "answerdotai/ModernBERT-large"
-
-# Load model and tokenizer (only once)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float16,
-    attn_implementation="eager"  # Use standard attention implementation for broader compatibility
-).to(device)
-model.eval()
+if 'token_count' not in columns:
+    print("Adding token_count column...")
+    conn.execute('''
+        ALTER TABLE papers 
+        ADD COLUMN token_count INTEGER
+    ''')
+    conn.commit()
 
 # %% [markdown]
-# ## 4. Embedding Generation
+# ## 3. Embedding Generation
 
 # %%
-def generate_embeddings(
-    texts: List[str],
-    pooling: str = "mean",
-    normalize: bool = True
-) -> np.ndarray:
-    """Generate embeddings for a batch of texts using ModernBERT.
-    
-    Args:
-        texts: List of texts to embed
-        pooling: Pooling strategy ('mean' or 'cls')
-            - mean: Average all token embeddings (better for retrieval/clustering)
-            - cls: Use [CLS] token embedding
-        normalize: Whether to L2-normalize embeddings (recommended for clustering)
-    
-    Returns:
-        numpy.ndarray: Array of embeddings, shape (n_texts, 1024)
-    """
-    # Tokenize texts
-    inputs = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=8192,  # Use ModernBERT's full context length
-        return_tensors="pt"
-    ).to(device)
-    
-    # Generate embeddings
-    with torch.no_grad():
-        outputs = model(**inputs)
-        hidden_states = outputs.last_hidden_state
-        
-        if pooling == "mean":
-            # Mean pooling with attention mask
-            attention_mask = inputs['attention_mask']
-            mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-            sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
-            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-            embeddings = sum_embeddings / sum_mask
-        else:  # cls pooling
-            embeddings = hidden_states[:, 0]
-        
-        # Optionally normalize
-        if normalize:
-            embeddings = F.normalize(embeddings, p=2, dim=1)
-        
-        return embeddings.cpu().numpy().astype(np.float32)
+# Configuration
+max_batches = 1  # Set to None to process all batches, or a number to limit processing
+batch_size = 128  # Maximum batch size for Voyage AI
 
-def get_csai_papers(conn: sqlite3.Connection, batch_size_ref: dict):
+# Rate limit tracking
+class RateLimiter:
+    def __init__(self, rpm_limit: int = 2000, tpm_limit: int = 8_000_000, window_seconds: int = 60):
+        self.rpm_limit = rpm_limit
+        self.tpm_limit = tpm_limit
+        self.window_seconds = window_seconds
+        self.requests = []
+        self.tokens = []
+    
+    def add_request(self, token_count: int = 0):
+        current_time = time.time()
+        # Clean up old entries
+        cutoff_time = current_time - self.window_seconds
+        self.requests = [t for t in self.requests if t > cutoff_time]
+        self.tokens = [t for t, _ in self.tokens if t > cutoff_time]
+        
+        # Add new request
+        self.requests.append(current_time)
+        if token_count > 0:
+            self.tokens.append((current_time, token_count))
+    
+    def can_make_request(self, token_count: int = 0) -> Tuple[bool, Optional[float]]:
+        current_time = time.time()
+        cutoff_time = current_time - self.window_seconds
+        
+        # Clean up old entries
+        self.requests = [t for t in self.requests if t > cutoff_time]
+        self.tokens = [(t, c) for t, c in self.tokens if t > cutoff_time]
+        
+        # Check RPM limit
+        if len(self.requests) >= self.rpm_limit:
+            wait_time = self.requests[0] - cutoff_time
+            return False, wait_time
+        
+        # Check TPM limit
+        current_tokens = sum(count for _, count in self.tokens)
+        if current_tokens + token_count > self.tpm_limit:
+            # Find the earliest time when we'll be under the limit
+            sorted_tokens = sorted(self.tokens)
+            running_sum = current_tokens + token_count
+            for t, c in sorted_tokens:
+                running_sum -= c
+                if running_sum <= self.tpm_limit:
+                    wait_time = t - cutoff_time
+                    return False, wait_time
+        
+        return True, None
+
+rate_limiter = RateLimiter()
+
+def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 128):
     """Generator that yields batches of papers with cs.AI in their categories
     
     Args:
         conn: Database connection
-        batch_size_ref: Dictionary containing current batch size, allows for dynamic updates
+        batch_size: Maximum number of papers per batch
     """
     cursor = conn.cursor()
     
@@ -168,136 +178,132 @@ def get_csai_papers(conn: sqlite3.Connection, batch_size_ref: dict):
     with tqdm(total=total_papers, desc="Processing papers", unit=" papers") as pbar:
         for row in cursor:
             batch.append((row['id'], row['abstract']))
-            if len(batch) >= batch_size_ref['size']:
+            if len(batch) >= batch_size:
                 pbar.update(len(batch))
                 yield batch
                 batch = []
-                # Clear CUDA cache after each batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
         if batch:
             pbar.update(len(batch))
             yield batch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-def get_gpu_memory_free():
-    """Get actual free GPU memory in GB, accounting for all reserved memory"""
-    if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        reserved = torch.cuda.max_memory_reserved() / 1024**3
-        return total - reserved
-    return 0
-
-def get_gpu_memory_stats():
-    """Get GPU memory statistics in GB"""
-    if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        reserved = torch.cuda.max_memory_reserved() / 1024**3
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        cached = torch.cuda.memory_reserved() / 1024**3
-        return {
-            'total': total,
-            'reserved': reserved,
-            'allocated': allocated,
-            'cached': cached,
-            'free_total': total - reserved,
-            'free_cached': cached - allocated
-        }
-    return None
-
-def calculate_batch_adjustment(current_size: int, peak_memory: float) -> Optional[int]:
-    """Calculate new batch size based on memory usage.
+def adjust_batch_for_token_limit(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -> List[List[Tuple[str, str]]]:
+    """Split a batch into sub-batches that respect the token limit
     
     Args:
-        current_size: Current batch size
-        peak_memory: Peak memory used by current batch in GB
-        
-    Returns:
-        Optional[int]: New batch size if adjustment needed, None otherwise
-    """
-    stats = get_gpu_memory_stats()
-    if not stats:
-        return None
-        
-    # How many times our current batch could fit in memory (leaving 2GB buffer)
-    memory_headroom = (stats['total'] - 2.0) / peak_memory if peak_memory > 0 else 1
+        batch: List of (id, abstract) tuples
+        model: Voyage AI model to use
     
-    # Target range: 1.2-1.4x headroom
-    if memory_headroom > 1.4:  # Using too little memory
-        # Increase batch size to target 1.3x headroom
-        increase_factor = min(memory_headroom / 1.3, 1.3)
-        return int(current_size * increase_factor)
-    elif memory_headroom < 1.2:  # Using too much memory
-        # Reduce batch size to target 1.3x headroom
-        decrease_factor = 1.3 / memory_headroom
-        return int(current_size / decrease_factor)
-    return None  # We're in the optimal range
+    Returns:
+        List of batches, each respecting the token limit
+    """
+    TOKEN_LIMIT = 120_000  # voyage-3-large limit
+    
+    abstracts = [item[1] for item in batch]
+    token_counts = [vo.count_tokens([abstract], model=model) for abstract in abstracts]
+    
+    sub_batches = []
+    current_batch = []
+    current_tokens = 0
+    
+    for (paper_id, abstract), token_count in zip(batch, token_counts):
+        # If single abstract exceeds limit, skip it
+        if token_count > TOKEN_LIMIT:
+            print(f"Warning: Abstract {paper_id} exceeds token limit ({token_count} tokens), skipping")
+            continue
+            
+        # If adding this abstract would exceed limit, start new batch
+        if current_tokens + token_count > TOKEN_LIMIT:
+            if current_batch:
+                sub_batches.append(current_batch)
+            current_batch = [(paper_id, abstract)]
+            current_tokens = token_count
+        else:
+            current_batch.append((paper_id, abstract))
+            current_tokens += token_count
+    
+    if current_batch:
+        sub_batches.append(current_batch)
+    
+    return sub_batches
+
+def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -> List[Tuple[str, List[float], int]]:
+    """Process a batch of papers, returning embeddings and token counts
+    
+    Args:
+        batch: List of (id, abstract) tuples
+        model: Voyage AI model to use
+    
+    Returns:
+        List of (id, embedding, token_count) tuples
+    """
+    abstracts = [item[1] for item in batch]
+    
+    # First count tokens
+    token_count = vo.count_tokens(abstracts, model=model)
+    
+    # Check rate limits and wait if necessary
+    can_proceed, wait_time = rate_limiter.can_make_request(token_count)
+    if not can_proceed:
+        print(f"\nRate limit reached, waiting {wait_time:.1f} seconds...")
+        time.sleep(wait_time + 0.1)  # Add small buffer
+    
+    # Generate embeddings with 2048 dimensions
+    result = vo.embed(
+        abstracts,
+        model=model,
+        input_type="document",
+        output_dimension=2048
+    )
+    
+    # Update rate limiter
+    rate_limiter.add_request(token_count)
+    
+    # Return list of (id, embedding, token_count) tuples
+    return list(zip(
+        [item[0] for item in batch],
+        result.embeddings,
+        [token_count] * len(batch)  # Each abstract's token count
+    ))
 
 # Process in batches
 total_updated = 0
-batch_size_ref = {'size': 256}  # Mutable reference to batch size
+batches_processed = 0
 
 try:
-    while True:  # Keep trying until we succeed or hit an unrecoverable error
-        try:
-            for batch in get_csai_papers(conn, batch_size_ref):
-                # Reset peak stats before processing
-                if torch.cuda.is_available():
-                    torch.cuda.reset_peak_memory_stats()
-                
-                paper_ids = [item[0] for item in batch]
-                abstracts = [item[1] for item in batch]
-                
-                # Generate embeddings with mean pooling and normalization
-                embeddings = generate_embeddings(
-                    abstracts,
-                    pooling="mean",  # Better for document similarity
-                    normalize=True   # Better for clustering
-                )
-                
-                # Calculate actual memory used by this batch
-                peak_memory = torch.cuda.max_memory_allocated() / 1024**3  # GB
+    for batch in get_csai_papers(conn, batch_size):
+        if max_batches is not None and batches_processed >= max_batches:
+            print(f"\nStopping after {max_batches} batch(es) as requested")
+            break
+            
+        # Split batch if needed to respect token limit
+        sub_batches = adjust_batch_for_token_limit(batch)
+        
+        for sub_batch in sub_batches:
+            try:
+                # Process batch and get embeddings
+                results = process_batch(sub_batch)
                 
                 # Store in database
                 cursor = conn.cursor()
-                for paper_id, embedding in zip(paper_ids, embeddings):
-                    embedding_blob = embedding.tobytes()
+                for paper_id, embedding, token_count in results:
+                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
                     cursor.execute('''
                         UPDATE papers
-                        SET abstract_embedding = ?
+                        SET abstract_embedding = ?,
+                            token_count = ?
                         WHERE id = ?
-                    ''', (embedding_blob, paper_id))
+                    ''', (embedding_blob, token_count, paper_id))
                 
                 conn.commit()
-                total_updated += len(batch)
+                total_updated += len(sub_batch)
                 
-                # Check if we should adjust batch size
-                new_size = calculate_batch_adjustment(batch_size_ref['size'], peak_memory)
-                if new_size:
-                    old_size = batch_size_ref['size']
-                    batch_size_ref['size'] = new_size
-                    print(f"\nAdjusting batch size: {old_size} → {new_size} (peak memory: {peak_memory:.1f}GB)")
-                
-                # Clear CUDA cache after each batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
-            
-            # If we complete the loop without OOM errors, we're done
-            break
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                old_size = batch_size_ref['size']
-                # Reduce by 20%
-                batch_size_ref['size'] = int(old_size * 0.8)
-                print(f"\nCUDA out of memory - reducing batch size: {old_size} → {batch_size_ref['size']}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
+            except Exception as e:
+                print(f"\nError processing batch: {str(e)}")
                 continue
-            raise  # Re-raise if it's not an OOM error
+        
+        batches_processed += 1
+        if max_batches is not None:
+            print(f"\nProcessed {batches_processed}/{max_batches} batch(es)")
 
 except Exception as e:
     print(f"\nFatal error in embedding generation: {str(e)}")
@@ -305,9 +311,10 @@ except Exception as e:
 finally:
     print(f"\nProcess completed:")
     print(f"- Total papers processed: {total_updated}")
+    print(f"- Total batches processed: {batches_processed}")
 
 # %% [markdown]
-# ## 5. Data Quality Validation
+# ## 4. Data Quality Validation
 
 # %%
 import numpy as np
@@ -317,9 +324,6 @@ def validate_embeddings(conn):
     """Run quality checks on generated embeddings"""
     # Set fixed seeds for reproducibility
     np.random.seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-    torch.manual_seed(42)
     
     cursor = conn.cursor()
     
@@ -514,9 +518,10 @@ def validate_embeddings(conn):
 validate_embeddings(conn)
 
 # %% [markdown]
-# ## 6. Database Backup
+# ## 5. Database Backup
 
 # %%
 # Copy updated database back to Drive
 !cp {local_db} "{db_path}"
 print("Database backup completed to Google Drive")
+
