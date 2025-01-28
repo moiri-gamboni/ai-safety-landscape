@@ -34,6 +34,12 @@ from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from typing import List, Tuple, Optional
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+import re
 
 # Load API key - try Colab form first, then .env
 if 'COLAB_GPU' in os.environ:
@@ -74,46 +80,25 @@ if 'abstract_embedding' not in columns:
     ''')
     conn.commit()
 
-if 'token_count' not in columns:
-    print("Adding token_count column...")
-    conn.execute('''
-        ALTER TABLE papers 
-        ADD COLUMN token_count INTEGER
-    ''')
-    conn.commit()
-
 # %% [markdown]
 # ## 3. Embedding Generation
 
 # %%
 # Configuration
-max_batches = 1  # Set to None to process all batches, or a number to limit processing
+max_batches = None  # Set to None to process all batches, or a number to limit processing
 batch_size = 128  # Maximum batch size for Voyage AI
 
 # Rate limit tracking
 class RateLimiter:
-    def __init__(self, rpm_limit: int = 2000, tpm_limit: int = 8_000_000, window_seconds: int = 60):
+    def __init__(self, rpm_limit=2000, tpm_limit=3_000_000):  # voyage-3-large limits: 2000 RPM, 3M TPM
         self.rpm_limit = rpm_limit
         self.tpm_limit = tpm_limit
-        self.window_seconds = window_seconds
-        self.requests = []
-        self.tokens = []
-    
-    def add_request(self, token_count: int = 0):
-        current_time = time.time()
-        # Clean up old entries
-        cutoff_time = current_time - self.window_seconds
-        self.requests = [t for t in self.requests if t > cutoff_time]
-        self.tokens = [t for t, _ in self.tokens if t > cutoff_time]
+        self.requests = []  # List of timestamps
+        self.tokens = []    # List of (timestamp, token_count) tuples
         
-        # Add new request
-        self.requests.append(current_time)
-        if token_count > 0:
-            self.tokens.append((current_time, token_count))
-    
-    def can_make_request(self, token_count: int = 0) -> Tuple[bool, Optional[float]]:
+    def can_make_request(self, token_count):
         current_time = time.time()
-        cutoff_time = current_time - self.window_seconds
+        cutoff_time = current_time - 60  # 1 minute ago
         
         # Clean up old entries
         self.requests = [t for t in self.requests if t > cutoff_time]
@@ -121,24 +106,34 @@ class RateLimiter:
         
         # Check RPM limit
         if len(self.requests) >= self.rpm_limit:
-            wait_time = self.requests[0] - cutoff_time
-            return False, wait_time
-        
+            print(f"\nRate limit reached at {time.strftime('%H:%M:%S')}:")
+            print(f"- Request limit: {len(self.requests)}/{self.rpm_limit} RPM")
+            return False
+            
         # Check TPM limit
-        current_tokens = sum(count for _, count in self.tokens)
-        if current_tokens + token_count > self.tpm_limit:
-            # Find the earliest time when we'll be under the limit
-            sorted_tokens = sorted(self.tokens)
-            running_sum = current_tokens + token_count
-            for t, c in sorted_tokens:
-                running_sum -= c
-                if running_sum <= self.tpm_limit:
-                    wait_time = t - cutoff_time
-                    return False, wait_time
+        total_tokens = sum(count for _, count in self.tokens)
+        if total_tokens + token_count > self.tpm_limit:
+            print(f"\nRate limit reached at {time.strftime('%H:%M:%S')}:")
+            print(f"- Token limit: {total_tokens + token_count}/{self.tpm_limit} TPM")
+            return False
+            
+        return True
         
-        return True, None
+    def add_request(self, token_count):
+        current_time = time.time()
+        self.requests.append(current_time)
+        self.tokens.append((current_time, token_count))
 
 rate_limiter = RateLimiter()
+
+@retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
+def embed_with_backoff(abstracts, model="voyage-3-large"):
+    return vo.embed(
+        abstracts,
+        model=model,
+        input_type="document",
+        output_dimension=2048
+    )
 
 def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 128):
     """Generator that yields batches of papers with cs.AI in their categories
@@ -226,48 +221,51 @@ def adjust_batch_for_token_limit(batch: List[Tuple[str, str]], model: str = "voy
     
     return sub_batches
 
-def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -> List[Tuple[str, List[float], int]]:
-    """Process a batch of papers, returning embeddings and token counts
-    
-    Args:
-        batch: List of (id, abstract) tuples
-        model: Voyage AI model to use
-    
-    Returns:
-        List of (id, embedding, token_count) tuples
-    """
+def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -> List[Tuple[str, List[float]]]:
+    """Process a batch of papers, returning embeddings"""
     abstracts = [item[1] for item in batch]
+    paper_ids = [item[0] for item in batch]
     
-    # First count tokens
-    token_count = vo.count_tokens(abstracts, model=model)
+    # First count tokens for rate limiting
+    try:
+        token_count = vo.count_tokens(abstracts, model=model)
+    except Exception as e:
+        print(f"Error counting tokens: {str(e)}")
+        raise
     
-    # Check rate limits and wait if necessary
-    can_proceed, wait_time = rate_limiter.can_make_request(token_count)
-    if not can_proceed:
-        print(f"\nRate limit reached, waiting {wait_time:.1f} seconds...")
-        time.sleep(wait_time + 0.1)  # Add small buffer
+    # Check rate limits
+    if not rate_limiter.can_make_request(token_count):
+        raise Exception("Rate limit exceeded")  # This will trigger exponential backoff
     
-    # Generate embeddings with 2048 dimensions
-    result = vo.embed(
-        abstracts,
-        model=model,
-        input_type="document",
-        output_dimension=2048
-    )
-    
-    # Update rate limiter
-    rate_limiter.add_request(token_count)
-    
-    # Return list of (id, embedding, token_count) tuples
-    return list(zip(
-        [item[0] for item in batch],
-        result.embeddings,
-        [token_count] * len(batch)  # Each abstract's token count
-    ))
+    # Generate embeddings with exponential backoff
+    try:
+        result = embed_with_backoff(abstracts, model=model)
+        
+        if isinstance(result, float):
+            raise ValueError(f"API returned float instead of EmbeddingsObject: {result}")
+            
+        if not hasattr(result, 'embeddings'):
+            raise ValueError(f"Unexpected response from vo.embed: {result}")
+            
+        # Return list of (paper_id, embedding) tuples and total tokens used
+        embeddings = result.embeddings
+        rate_limiter.add_request(token_count)
+        
+        return [(paper_id, embedding) for paper_id, embedding in zip(paper_ids, embeddings)], result.total_tokens
+            
+    except Exception as e:
+        print("\nError in vo.embed call:")
+        print(f"Exception type: {type(e)}")
+        print(f"Exception args: {e.args}")
+        print(f"Full exception: {repr(e)}")
+        print("\nInput that caused error:")
+        print(f"First abstract: {abstracts[0][:500]}...")  # Truncate long abstracts
+        raise
 
 # Process in batches
 total_updated = 0
 batches_processed = 0
+total_tokens = 0
 
 try:
     for batch in get_csai_papers(conn, batch_size):
@@ -278,28 +276,38 @@ try:
         # Split batch if needed to respect token limit
         sub_batches = adjust_batch_for_token_limit(batch)
         
-        for sub_batch in sub_batches:
+        for i, sub_batch in enumerate(sub_batches):
             try:
                 # Process batch and get embeddings
-                results = process_batch(sub_batch)
+                results, batch_tokens = process_batch(sub_batch)
+                if not isinstance(results, list):
+                    print(f"Warning: results is not a list, got {type(results)}")
+                    print(f"Results value: {results}")
+                    raise ValueError(f"Expected list result, got {type(results)}")
                 
                 # Store in database
                 cursor = conn.cursor()
-                for paper_id, embedding, token_count in results:
+                for paper_id, embedding in results:
                     embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
                     cursor.execute('''
                         UPDATE papers
-                        SET abstract_embedding = ?,
-                            token_count = ?
+                        SET abstract_embedding = ?
                         WHERE id = ?
-                    ''', (embedding_blob, token_count, paper_id))
+                    ''', (embedding_blob, paper_id))
                 
                 conn.commit()
                 total_updated += len(sub_batch)
                 
+                # Update total tokens
+                total_tokens += batch_tokens
+                
             except Exception as e:
-                print(f"\nError processing batch: {str(e)}")
-                continue
+                print(f"\nFatal error processing sub-batch:")
+                print(f"Exception type: {type(e)}")
+                print(f"Exception args: {e.args}")
+                print(f"Full exception: {repr(e)}")
+                print(f"Sub-batch contents: {sub_batch[:2]}...")
+                raise  # Stop execution here
         
         batches_processed += 1
         if max_batches is not None:
@@ -312,6 +320,7 @@ finally:
     print(f"\nProcess completed:")
     print(f"- Total papers processed: {total_updated}")
     print(f"- Total batches processed: {batches_processed}")
+    print(f"- Total tokens processed: {total_tokens:,}")
 
 # %% [markdown]
 # ## 4. Data Quality Validation
@@ -460,59 +469,93 @@ def validate_embeddings(conn):
         print("\n5. Similarity Analysis:")
         print("Not enough samples for similarity analysis")
     
-    # # Get potential duplicates (papers with same title)
-    # cursor.execute('''
-    #     SELECT p1.id as id1, p2.id as id2,
-    #            p1.title as title1,
-    #            p1.abstract as abstract1,
-    #            p2.abstract as abstract2,
-    #            p1.abstract_embedding as e1,
-    #            p2.abstract_embedding as e2
-    #     FROM papers p1
-    #     JOIN papers p2 ON LOWER(TRIM(p1.title)) = LOWER(TRIM(p2.title))
-    #     WHERE p1.id < p2.id  -- Avoid self-joins and duplicates
-    #       AND p1.withdrawn = 0 AND p2.withdrawn = 0
-    #       AND p1.abstract_embedding IS NOT NULL
-    #       AND p2.abstract_embedding IS NOT NULL
-    #       AND p1.categories LIKE '%cs.AI%'
-    #       AND p2.categories LIKE '%cs.AI%'
-    #     LIMIT 50
-    # ''')
+    # 5. Embedding Analysis
+    print("\n5. Embedding Analysis:")
     
-    # rows = cursor.fetchall()
-    # if rows:
-    #     # Process all pairs at once
-    #     e1 = np.vstack([np.frombuffer(row['e1'], dtype=np.float32) for row in rows])
-    #     e2 = np.vstack([np.frombuffer(row['e2'], dtype=np.float32) for row in rows])
-    #     similarities = np.sum(e1 * e2, axis=1)
+    def find_outliers(embeddings: np.ndarray, papers: list, n_examples: int = 3):
+        """Find outlier papers based on their similarity to other papers
         
-    #     print(f"\n6. Same-title Analysis:")
-    #     print(f"- Same-title pairs (n={len(similarities)}):")
-    #     print(f"  Mean: {np.mean(similarities):.3f} ± {np.std(similarities):.3f}")
-    #     print(f"  Range: [{np.min(similarities):.3f}, {np.max(similarities):.3f}]")
+        Args:
+            embeddings: Array of embeddings (each normalized to unit length)
+            papers: List of paper records corresponding to embeddings
+            n_examples: Number of outlier examples to show
+        """
+        # Calculate pairwise similarities
+        similarities = cosine_similarity(embeddings)
         
-    #     # Print example same-title pairs
-    #     print("\nExample same-title pairs:")
-    #     # Most similar pair
-    #     most_similar_idx = np.argmax(similarities)
-    #     print(f"\nMost similar pair (similarity: {similarities[most_similar_idx]:.3f}):")
-    #     print(f"Title: {rows[most_similar_idx]['title1']}")
-    #     print(f"URL 1: https://arxiv.org/abs/{rows[most_similar_idx]['id1']}")
-    #     print(f"Abstract 1:\n{rows[most_similar_idx]['abstract1']}")
-    #     print(f"\nURL 2: https://arxiv.org/abs/{rows[most_similar_idx]['id2']}")
-    #     print(f"Abstract 2:\n{rows[most_similar_idx]['abstract2']}")
+        # For each paper, get average similarity to other papers
+        # Exclude self-similarity (1.0) from the average
+        avg_similarities = []
+        for i in range(len(similarities)):
+            others = np.concatenate([similarities[i,:i], similarities[i,i+1:]])
+            avg_similarities.append(np.mean(others))
         
-    #     # Least similar pair
-    #     least_similar_idx = np.argmin(similarities)
-    #     print(f"\nLeast similar pair (similarity: {similarities[least_similar_idx]:.3f}):")
-    #     print(f"Title: {rows[least_similar_idx]['title1']}")
-    #     print(f"URL 1: https://arxiv.org/abs/{rows[least_similar_idx]['id1']}")
-    #     print(f"Abstract 1:\n{rows[least_similar_idx]['abstract1']}")
-    #     print(f"\nURL 2: https://arxiv.org/abs/{rows[least_similar_idx]['id2']}")
-    #     print(f"Abstract 2:\n{rows[least_similar_idx]['abstract2']}")
-    # else:
-    #     print("\n6. Same-title Analysis:")
-    #     print("No same-title pairs found for comparison")
+        avg_similarities = np.array(avg_similarities)
+        
+        # Use IQR method on average similarities
+        q1, q3 = np.percentile(avg_similarities, [25, 75])
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr  # Papers with unusually low average similarity
+        
+        # Find outliers (papers with unusually low average similarity to others)
+        outlier_indices = np.where(avg_similarities < lower_bound)[0]
+        
+        print(f"\nOutlier Analysis:")
+        print(f"- Average similarity stats:")
+        print(f"  Mean: {np.mean(avg_similarities):.3f} ± {np.std(avg_similarities):.3f}")
+        print(f"  Range: [{np.min(avg_similarities):.3f}, {np.max(avg_similarities):.3f}]")
+        print(f"- Found {len(outlier_indices)} outliers ({len(outlier_indices)/len(embeddings)*100:.1f}%)")
+        
+        if len(outlier_indices) > 0:
+            # Sort outliers by average similarity (ascending)
+            sorted_outliers = sorted(zip(outlier_indices, avg_similarities[outlier_indices]), 
+                                   key=lambda x: x[1])
+            
+            print(f"\nTop {n_examples} outliers (lowest average similarity to other papers):")
+            for idx, avg_sim in sorted_outliers[:n_examples]:
+                paper = papers[idx]
+                print(f"\nAverage similarity to other papers: {avg_sim:.3f}")
+                print(f"Title: {paper['title']}")
+                print(f"URL: https://arxiv.org/abs/{paper['id']}")
+                print(f"Abstract:\n{paper['abstract'][:500]}...")
+                
+                # Show a few most and least similar papers to this one
+                sims = similarities[idx]
+                most_similar_idx = np.argsort(sims)[-2]  # -1 would be self
+                least_similar_idx = np.argsort(sims)[0]
+                
+                print(f"\nMost similar paper (similarity: {sims[most_similar_idx]:.3f}):")
+                print(f"Title: {papers[most_similar_idx]['title']}")
+                
+                print(f"\nLeast similar paper (similarity: {sims[least_similar_idx]:.3f}):")
+                print(f"Title: {papers[least_similar_idx]['title']}")
+    
+    # Get sample of embeddings
+    cursor.execute('''
+        SELECT id, title, abstract, abstract_embedding
+        FROM papers 
+        WHERE abstract_embedding IS NOT NULL
+        LIMIT 1000
+    ''')
+    papers = cursor.fetchall()
+    embeddings = [np.frombuffer(row['abstract_embedding'], dtype=np.float32) for row in papers]
+    all_embeddings = np.array(embeddings)
+    
+    # Basic embedding stats
+    print(f"- Shape: {all_embeddings.shape}")
+    print("- Component statistics:")
+    means = np.mean(all_embeddings, axis=0)
+    stds = np.std(all_embeddings, axis=0)
+    print(f"  Mean of means: {np.mean(means):.3f} ± {np.std(means):.3f}")
+    print(f"  Mean of stds: {np.mean(stds):.3f} ± {np.std(stds):.3f}")
+    print(f"  Component range: [{np.min(all_embeddings):.3f}, {np.max(all_embeddings):.3f}]")
+    
+    # Show distribution of components
+    positive_frac = np.mean(all_embeddings > 0)
+    print(f"  Fraction of positive components: {positive_frac:.3f}")
+    
+    # Find outliers using the new method
+    find_outliers(all_embeddings, papers)
 
 # Run validation
 validate_embeddings(conn)

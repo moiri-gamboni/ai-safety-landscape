@@ -6,4 +6,4 @@ sickle
 pre-commit
 jupytext
 numpy
-scikit-learn
+tenacity
