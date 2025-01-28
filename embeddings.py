@@ -561,9 +561,104 @@ def validate_embeddings(conn):
 validate_embeddings(conn)
 
 # %% [markdown]
-# ## 5. Database Backup
+# ## 5. Duplicate Analysis
 
 # %%
+import re
+def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv'):
+    """Find potential duplicate papers based on title and embedding similarity
+    
+    Args:
+        conn: Database connection
+        similarity_threshold: Minimum similarity to consider as duplicate
+        output_file: Path to save results (CSV)
+    """
+    print("Finding potential duplicates...")
+    
+    def normalize_title(title):
+        """Normalize title for comparison"""
+        if not title:
+            return ""
+        title = title.lower()
+        title = re.sub(r'\bv\d+\b', '', title)
+        title = re.sub(r'arxiv:\d+\.\d+', '', title, flags=re.IGNORECASE)
+        title = re.sub(r'[^\w\s]', '', title)
+        return ' '.join(title.split())
+    
+    # Get papers with embeddings
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, title, abstract_embedding
+        FROM papers
+        WHERE abstract_embedding IS NOT NULL
+          AND withdrawn = 0
+    ''')
+    
+    # Group by normalized title
+    title_groups = {}
+    for row in cursor:
+        norm_title = normalize_title(row['title'])
+        if norm_title:  # Skip empty titles
+            if norm_title in title_groups:
+                title_groups[norm_title].append(row)
+            else:
+                title_groups[norm_title] = [row]
+    
+    # Find duplicates based on both title and embedding similarity
+    duplicates = []
+    
+    print(f"Analyzing {len(title_groups)} unique normalized titles...")
+    for title, group in title_groups.items():
+        if len(group) > 1:  # Only process groups with multiple papers
+            # Compare embeddings within group
+            embeddings = np.vstack([np.frombuffer(p['abstract_embedding'], dtype=np.float32) for p in group])
+            similarities = cosine_similarity(embeddings)
+            
+            # Find pairs above threshold (excluding self-similarity)
+            for i in range(len(similarities)):
+                for j in range(i+1, len(similarities)):
+                    if similarities[i,j] > similarity_threshold:
+                        duplicates.append({
+                            'id1': group[i]['id'],
+                            'id2': group[j]['id'],
+                            'title': group[i]['title'],
+                            'similarity': float(similarities[i,j])
+                        })
+    
+    # Sort by similarity
+    duplicates.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    # Save results
+    import csv
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['id1', 'id2', 'title', 'similarity'])
+        writer.writeheader()
+        writer.writerows(duplicates)
+    
+    # Print summary
+    print(f"\nFound {len(duplicates)} potential duplicate pairs")
+    print(f"Results saved to {output_file}")
+    
+    # Print top examples
+    if duplicates:
+        print("\nTop 5 potential duplicates:")
+        for dup in duplicates[:5]:
+            print(f"\nSimilarity: {dup['similarity']:.3f}")
+            print(f"Title: {dup['title']}")
+            print(f"Paper 1: https://arxiv.org/abs/{dup['id1']}")
+            print(f"Paper 2: https://arxiv.org/abs/{dup['id2']}")
+
+# Run duplicate analysis
+find_duplicates(conn)
+
+# %% [markdown]
+# ## 6. Save Results
+
+# %%
+# Save duplicates to Drive
+!cp duplicates.csv "/content/drive/MyDrive/ai-safety-papers/duplicates.csv"
+print(f"Duplicates saved to Drive")
+
 # Copy updated database back to Drive
 !cp {local_db} "{db_path}"
 print("Database backup completed to Google Drive")
