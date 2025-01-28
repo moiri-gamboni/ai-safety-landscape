@@ -26,15 +26,11 @@
 # Run this cell to set up the environment if using Google Colab.
 
 # %%
-# Clone repository if running in Colab
+# Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    # Clone the repository
-    !git clone https://github.com/moiri-gamboni/ai-safety-landscape.git
-    %cd ai-safety-landscape
-
-# Install required packages
-%pip install -r requirements.txt
+    # Install only the packages needed for this notebook
+    %pip install sickle tqdm
 
 # %% [markdown]
 # ## 1.2 Database Initialization

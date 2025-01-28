@@ -1,3 +1,9 @@
+# ---
+# jupyter:
+#   jupytext:
+#     formats: ipynb,py:percent
+# ---
+
 # %% [markdown]
 # # AI Safety Papers - Abstract Embedding Phase
 # 
@@ -11,15 +17,11 @@
 from google.colab import drive
 drive.mount('/content/drive')
 
-# Clone repository if running in Colab
+# Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    # Clone the repository
-    !git clone https://github.com/moiri-gamboni/ai-safety-landscape.git
-    %cd ai-safety-landscape
-
-# Install required packages
-%pip install -r requirements.txt
+    # Install only the packages needed for this notebook
+    %pip install voyageai tqdm scikit-learn tenacity
 
 # %% [markdown]
 # ## 2. Database Connection
@@ -30,7 +32,6 @@ import os
 import numpy as np
 from tqdm import tqdm
 import voyageai
-from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from typing import List, Tuple, Optional
@@ -41,7 +42,7 @@ from tenacity import (
 )
 import re
 
-# Load API key - try Colab form first, then .env
+# Load API key from Colab form or environment
 if 'COLAB_GPU' in os.environ:
     print("Getting Voyage AI API key from Colab form")
     # @title Voyage AI API Key
@@ -49,8 +50,10 @@ if 'COLAB_GPU' in os.environ:
     # Set it for the client
     voyageai.api_key = voyage_api_key
 else:
+    from dotenv import load_dotenv
     print("Running locally, loading API key from .env")
     load_dotenv()
+    voyageai.api_key = os.getenv('VOYAGE_API_KEY')
 
 # Initialize Voyage AI client
 vo = voyageai.Client()
@@ -416,7 +419,7 @@ def validate_embeddings(conn):
     positive_frac = np.mean(random_embeddings > 0)
     print(f"  Fraction of positive components: {positive_frac:.3f}")
     
-    # Compute similarities
+    # Compute similarities using dot product (faster for normalized vectors)
     n_samples = len(random_embeddings)
     if n_samples > 1:
         # Generate random pairs of indices
@@ -426,8 +429,8 @@ def validate_embeddings(conn):
         valid_pairs = idx1 != idx2
         idx1, idx2 = idx1[valid_pairs], idx2[valid_pairs]
         
-        # Compute cosine similarities properly
-        similarities = cosine_similarity(random_embeddings[idx1], random_embeddings[idx2]).diagonal()
+        # Compute dot products (equivalent to cosine similarity for normalized vectors)
+        similarities = np.sum(random_embeddings[idx1] * random_embeddings[idx2], axis=1)
         
         print("\n5. Similarity Analysis:")
         print(f"- Random pairs (n={len(similarities)}):")

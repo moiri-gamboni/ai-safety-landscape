@@ -23,7 +23,7 @@
 from google.colab import drive
 drive.mount('/content/drive')
 
-# Clone repository if running in Colab
+# Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
     # Install only the packages needed for this notebook
