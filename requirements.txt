@@ -7,3 +7,6 @@ pre-commit
 jupytext
 numpy
 tenacity
+scikit-learn
+--extra-index-url https://pypi.nvidia.com
+cuml-cu12==24.12.*
