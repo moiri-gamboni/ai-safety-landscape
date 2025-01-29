@@ -242,12 +242,19 @@ def load_umap_embeddings(run_id):
 # %%
 def objective(trial, embeddings):
     """Optuna optimization objective function"""
-    # UMAP parameters
+    # UMAP configuration
+    use_umap = trial.suggest_categorical('use_umap', [True, False])
     umap_params = {
-        'n_neighbors': trial.suggest_int('n_neighbors', 30, 100),
-        'min_dist': 0.0,  # Fixed for clustering
-        'n_components': trial.suggest_categorical('n_components', [0, 8, 15])  # 0 = no reduction
+        'min_dist': 0.0,
+        'n_components': 0,  # Default for no UMAP
+        'n_neighbors': 0    # Unused
     }
+    
+    if use_umap:
+        umap_params.update({
+            'n_components': trial.suggest_int('n_components', 15, 100),
+            'n_neighbors': trial.suggest_int('n_neighbors', 30, 100)
+        })
     
     # Check for existing UMAP run
     existing_umap_id = check_existing_umap_run(**umap_params)
@@ -265,7 +272,7 @@ def objective(trial, embeddings):
         'min_cluster_size': min_cluster_size,
         'min_samples': trial.suggest_int('min_samples', 5, min_cluster_size//2),
         'cluster_selection_method': trial.suggest_categorical('cluster_selection_method', ['eom', 'leaf']),
-        'cluster_selection_epsilon': trial.suggest_float('cluster_selection_epsilon', 0.0, 0.2)
+        'cluster_selection_epsilon': trial.suggest_float('cluster_selection_epsilon', 0.0, 0.5)
     }
     
     # Check for existing clustering run
@@ -289,14 +296,14 @@ def objective(trial, embeddings):
     labels = clusterer.fit_predict(reduced_embeddings)
     
     # Calculate metrics
-    if umap_params['n_components'] == 0:
+    if not use_umap:
         trust_score = 1.0  # Max score when using original embeddings
     else:
         trust_score = trustworthiness(embeddings, reduced_embeddings)
     
     cm = ClusteringMetric(X=reduced_embeddings, y_pred=labels)
     dbcvi_score = cm.DBCVI()
-    combined_score = 1 - dbcvi_score  # Directly use DBCVI since range is [0,1]
+    combined_score = dbcvi_score  # Directly use DBCVI since range is [0,1]
     
     # Save results to DB
     run_id = save_optimized_run(
@@ -426,8 +433,8 @@ def save_cluster_hierarchy(run_id, condensed_tree):
 def optimize_clustering(embeddings, n_trials=100):
     """Run optimization study"""
     study = optuna.create_study(
-        direction='maximize',
-        sampler=optuna.samplers.TPESampler(seed=42),
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
     )
     
@@ -454,9 +461,8 @@ def optimize_clustering(embeddings, n_trials=100):
 # ## 6. Run Optimization
 
 # %%
-if __name__ == '__main__':
-    study = optimize_clustering(embeddings, n_trials=100)
-    print("Optimization complete! Best parameters saved to database.")
+study = optimize_clustering(embeddings, n_trials=100)
+print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
 # ## 7. Database Backup
