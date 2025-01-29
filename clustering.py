@@ -126,7 +126,6 @@ CREATE TABLE IF NOT EXISTS cluster_hierarchy (
     child_cluster_id INTEGER,
     lambda_val REAL,
     child_size INTEGER,
-    persistence REAL,
     PRIMARY KEY (run_id, parent_cluster_id, child_cluster_id),
     FOREIGN KEY (run_id) REFERENCES clustering_runs(run_id)
 )''')
@@ -508,17 +507,16 @@ def save_cluster_hierarchy(run_id, condensed_tree):
     # Convert condensed tree to pandas DataFrame
     tree_df = condensed_tree.to_pandas()
     
-    # Filter meaningful relationships
+    # Filter meaningful relationships (exclude single-point clusters)
     meaningful_edges = tree_df[tree_df.child_size > 1]
-    
-    # Batch insert using executemany
+
+    # Batch insert using executemany with correct columns
     cursor.executemany('''
         INSERT INTO cluster_hierarchy
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
     ''', [
         (run_id, int(row.parent), int(row.child), 
-         float(row.lambda_val), int(row.child_size),
-         float(row.persistence))
+         float(row.lambda_val), int(row.child_size))
         for row in meaningful_edges.itertuples()
     ])
     
