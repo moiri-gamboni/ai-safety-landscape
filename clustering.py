@@ -190,7 +190,6 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
         n_neighbors=n_neighbors,
         min_dist=min_dist,
         metric='cosine',
-        verbose=True,
         output_type='cupy'
     )
     result = reducer.fit_transform(embeddings)
