@@ -33,6 +33,7 @@ if 'COLAB_GPU' in os.environ:
 # Core imports
 import sqlite3
 import cupy as cp
+import numpy as np
 
 # ML imports
 from cuml import UMAP
@@ -44,7 +45,6 @@ cuml.set_global_output_type('cupy')
 
 # Optimization imports
 import optuna
-from permetrics import ClusteringMetric
 
 # %% [markdown]
 # ## 2. Database Setup
@@ -248,6 +248,64 @@ def load_umap_embeddings(run_id):
 # ## 5. Optimization Setup
 
 # %%
+def compute_relative_validity(minimum_spanning_tree, labels):
+    """CPU-based relative validity score using HDBSCAN's MST"""
+    # Convert labels to numpy array for CPU operations
+    labels = cp.asnumpy(labels)  # Move to CPU
+    
+    # Extract edge information from MST (already CPU-based)
+    mst_df = minimum_spanning_tree.to_pandas()
+    
+    # Initialize metrics
+    noise_mask = labels == -1
+    valid_labels = labels[~noise_mask]
+    
+    if valid_labels.size == 0:
+        return -1.0  # All noise case
+    
+    cluster_sizes = np.bincount(valid_labels)
+    num_clusters = len(cluster_sizes)
+    total = len(labels)
+    
+    # Use numpy instead of cupy
+    DSC = np.zeros(num_clusters, dtype=np.float32)
+    DSPC_wrt = np.ones(num_clusters, dtype=np.float32) * np.inf
+    max_distance = 0.0
+    min_outlier_sep = np.inf
+
+    # Process edges using vectorized operations
+    edge_data = mst_df[['from', 'to', 'distance']].values
+    for from_idx, to_idx, length in edge_data:
+        max_distance = max(max_distance, length)
+        
+        label1 = labels[int(from_idx)]
+        label2 = labels[int(to_idx)]
+        
+        if label1 == -1 and label2 == -1:
+            continue
+        elif label1 == -1 or label2 == -1:
+            min_outlier_sep = min(min_outlier_sep, length)
+            continue
+            
+        if label1 == label2:
+            DSC[label1] = max(length, DSC[label1])
+        else:
+            DSPC_wrt[label1] = min(length, DSPC_wrt[label1])
+            DSPC_wrt[label2] = min(length, DSPC_wrt[label2])
+
+    # Handle edge cases
+    if np.isinf(min_outlier_sep):
+        min_outlier_sep = max_distance if num_clusters > 1 else max_distance
+        
+    # Correct infinite values
+    correction = 2.0 * (max_distance if num_clusters > 1 else min_outlier_sep)
+    DSPC_wrt = np.where(DSPC_wrt == np.inf, correction, DSPC_wrt)
+    
+    # Compute final score
+    V_index = (DSPC_wrt - DSC) / np.maximum(DSPC_wrt, DSC)
+    weighted_V = (cluster_sizes * V_index) / total
+    return float(np.sum(weighted_V))
+
 def objective(trial, embeddings):
     """Optuna optimization objective function"""
     # UMAP configuration
@@ -315,14 +373,14 @@ def objective(trial, embeddings):
           f"({cp.sum(labels == -1).item()} noise points)")
     
     # Calculate metrics
-    print("\nCalculating metrics...")
+    print("\nCalculating trustworthiness...")
     if not use_umap:
         trust_score = 1.0  # Max score when using original embeddings
     else:
         trust_score = trustworthiness(embeddings, reduced_embeddings)
     
-    cm = ClusteringMetric(X=reduced_embeddings, y_pred=labels)
-    dbcvi_score = cm.DBCVI()
+    print("\nCalculating DBCVI score...")
+    dbcvi_score = compute_relative_validity(clusterer.minimum_spanning_tree_, labels)
     
     # Save results to DB
     run_id = save_optimized_run(
@@ -439,33 +497,36 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
     return run_id
 
 def save_cluster_hierarchy(run_id, condensed_tree):
-    """Save cluster hierarchy data"""
+    """Save cluster hierarchy relationships (CPU-based)"""
     print("\nSaving cluster hierarchy relationships...")
     cursor = conn.cursor()
-    count = 0
-    for row in condensed_tree.itertuples():
-        if row.child_size > 1:
-            count += 1
-            cursor.execute('''
-                INSERT INTO cluster_hierarchy
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                run_id,
-                int(row.parent),
-                int(row.child),
-                float(row.lambda_val),
-                int(row.child_size),
-                float(row.persistence)
-            ))
+    
+    # Convert condensed tree to pandas DataFrame
+    tree_df = condensed_tree.to_pandas()
+    
+    # Filter meaningful relationships
+    meaningful_edges = tree_df[tree_df.child_size > 1]
+    
+    # Batch insert using executemany
+    cursor.executemany('''
+        INSERT INTO cluster_hierarchy
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', [
+        (run_id, int(row.parent), int(row.child), 
+         float(row.lambda_val), int(row.child_size),
+         float(row.persistence))
+        for row in meaningful_edges.itertuples()
+    ])
+    
     conn.commit()
-    print(f"Saved {count} hierarchy relationships for run {run_id}")
+    print(f"Saved {len(meaningful_edges)} hierarchy relationships for run {run_id}")
 
 def optimize_clustering(embeddings, n_trials=50):
     """Run optimization study"""
-    study = optuna.create_study(direction='minimize')
+    study = optuna.create_study(direction='maximize')
     
     # Track best run across all trials
-    best_score = float('inf')
+    best_score = -float('inf')
     best_run_id = None
     
     def log_and_update_best(study, trial):
@@ -478,16 +539,14 @@ def optimize_clustering(embeddings, n_trials=50):
         
         # Update best run if improved
         current_best = study.best_trial
-        if current_best.value < best_score:
+        if current_best.value > best_score:
             best_score = current_best.value
             new_best_id = current_best.user_attrs['db_run_id']
             
             if new_best_id != best_run_id:
                 print(f"New best run found! Updating marker to run {new_best_id}")
                 cursor = conn.cursor()
-                # Clear previous optimal marker
                 cursor.execute('UPDATE clustering_runs SET is_optimal = 0')
-                # Set new optimal marker
                 cursor.execute('''
                     UPDATE clustering_runs 
                     SET is_optimal = 1 
