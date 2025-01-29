@@ -26,9 +26,9 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    %pip install optuna permetrics hdbscan umap-learn cupy-cuda11x
-    !git clone https://github.com/rapidsai/rapidsai-csp-utils.git
-    !python rapidsai-csp-utils/colab/pip-install.py
+    %pip install optuna hdbscan umap-learn numpy cupy-cuda12x # pyright: ignore
+    !git clone https://github.com/rapidsai/rapidsai-csp-utils.git # pyright: ignore
+    !python rapidsai-csp-utils/colab/pip-install.py # pyright: ignore
 
 # Core imports
 import sqlite3
