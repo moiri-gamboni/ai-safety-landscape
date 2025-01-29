@@ -575,7 +575,7 @@ def optimize_clustering(embeddings, n_trials=50):
 # ## 6. Run Optimization
 
 # %%
-study = optimize_clustering(embeddings, n_trials=100)
+study = optimize_clustering(embeddings, n_trials=50)
 print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
