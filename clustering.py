@@ -26,19 +26,19 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    %pip install --extra-index-url=https://pypi.nvidia.com numpy scikit-learn cuml-cu12==24.12.* tqdm optuna permetrics # pyright: ignore
+    %pip install numpy optuna permetrics hdbscan umap-learn # pyright: ignore
+    !git clone https://github.com/rapidsai/rapidsai-csp-utils.git # pyright: ignore
+    !python rapidsai-csp-utils/colab/pip-install.py # pyright: ignore
 
 # Core imports
 import sqlite3
 import numpy as np
-from tqdm import tqdm
 
 # ML imports
 from cuml import UMAP
 from cuml.preprocessing import StandardScaler
 from cuml.cluster.hdbscan import HDBSCAN
 from cuml.metrics.trustworthiness import trustworthiness
-from scipy.spatial.distance import cdist
 
 # Optimization imports
 import optuna
