@@ -15,14 +15,14 @@ import sqlite3
 import os
 
 # Mount Google Drive
-from google.colab import drive
+from google.colab import drive # pyright: ignore [reportMissingImports]
 drive.mount('/content/drive')
 
 # Check if database exists in Drive
 db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
 if os.path.exists(db_path):
     print(f"Found existing database at {db_path}")
-    !cp "{db_path}" papers.db
+    %cp "{db_path}" papers.db # pyright: ignore
     
     # Print existing data summary
     conn = sqlite3.connect('papers.db')
@@ -363,5 +363,5 @@ cleanup_author_commas(conn)
 # ## Save Database to Drive
 
 # %%
-!cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db"
+%cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db" # pyright: ignore
 print("Database saved to Google Drive at: /ai-safety-papers/papers.db") 

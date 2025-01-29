@@ -30,7 +30,7 @@
 import os
 if 'COLAB_GPU' in os.environ:
     # Install only the packages needed for this notebook
-    %pip install sickle tqdm
+    %pip install sickle tqdm # pyright: ignore
 
 # %% [markdown]
 # ## 1.2 Database Initialization
@@ -46,7 +46,7 @@ import os
 def load_existing_database():
     """Load existing database from Google Drive"""
     # Mount Google Drive
-    from google.colab import drive
+    from google.colab import drive # pyright: ignore [reportMissingImports]
     drive.mount('/content/drive')
 
     # Check if database exists in Drive
@@ -55,7 +55,7 @@ def load_existing_database():
         raise FileNotFoundError(f"No database found at {db_path}")
         
     print(f"Found existing database at {db_path}")
-    !cp "{db_path}" papers.db
+    %cp "{db_path}" papers.db # pyright: ignore
     
     # Connect and print summary
     conn = sqlite3.connect('papers.db')
@@ -838,14 +838,14 @@ inspect_papers(conn)
 
 # %%
 # Mount Google Drive
-from google.colab import drive
+from google.colab import drive # pyright: ignore [reportMissingImports]
 drive.mount('/content/drive')
 
 # Create project directory if it doesn't exist
-!mkdir -p "/content/drive/MyDrive/ai-safety-papers"
+%mkdir -p "/content/drive/MyDrive/ai-safety-papers" # pyright: ignore
 
 # Copy database to Drive
-!cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db"
+%cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db" # pyright: ignore
 print("Database saved to Google Drive at: /ai-safety-papers/papers.db")
 
 # %% [markdown]

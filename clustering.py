@@ -20,14 +20,14 @@
 
 # %%
 # Mount Google Drive
-from google.colab import drive
+from google.colab import drive # pyright: ignore [reportMissingImports]
 drive.mount('/content/drive')
 
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
     # Install only the packages needed for this notebook
-    %pip install --extra-index-url=https://pypi.nvidia.com numpy scikit-learn cuml-cu12==24.12.* tqdm
+    %pip install --extra-index-url=https://pypi.nvidia.com numpy scikit-learn cuml-cu12==24.12.* tqdm # pyright: ignore
 
 # Core imports
 import sqlite3
@@ -54,7 +54,7 @@ local_db = "papers.db"
 # Copy database to local storage if needed
 print(f"Copying database to local storage: {local_db}")
 if not os.path.exists(local_db):
-    %cp "{db_path}" {local_db}
+    %cp "{db_path}" {local_db} # pyright: ignore
 
 conn = sqlite3.connect(local_db)
 conn.row_factory = sqlite3.Row
@@ -613,5 +613,5 @@ else:
 
 # %%
 # Copy updated database back to Drive
-!cp {local_db} "{db_path}"
-print("Database backup completed to Google Drive") 
+%cp {local_db} "{db_path}" # pyright: ignore
+print("Database backup completed to Google Drive")
