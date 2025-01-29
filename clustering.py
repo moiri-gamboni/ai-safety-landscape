@@ -433,15 +433,19 @@ def save_cluster_hierarchy(run_id, condensed_tree):
 def optimize_clustering(embeddings, n_trials=100):
     """Run optimization study"""
     study = optuna.create_study(
-        direction='minimize',
-        sampler=optuna.samplers.TPESampler(),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
+        direction='minimize'
     )
+    
+    # Add logging callback
+    def log_trial(study, trial):
+        print(f"\nTrial {trial.number} finished:")
+        print(f"Params: {trial.params}")
+        print(f"Value: {trial.value:.3f}")
     
     study.optimize(
         lambda trial: objective(trial, embeddings),
         n_trials=n_trials,
-        catch=(Exception,)
+        callbacks=[log_trial]
     )
     
     # Fix best run marking
