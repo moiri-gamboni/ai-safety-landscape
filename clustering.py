@@ -26,19 +26,21 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    %pip install numpy optuna permetrics hdbscan umap-learn # pyright: ignore
-    !git clone https://github.com/rapidsai/rapidsai-csp-utils.git # pyright: ignore
-    !python rapidsai-csp-utils/colab/pip-install.py # pyright: ignore
+    %pip install optuna permetrics hdbscan umap-learn cupy-cuda11x
+    !git clone https://github.com/rapidsai/rapidsai-csp-utils.git
+    !python rapidsai-csp-utils/colab/pip-install.py
 
 # Core imports
 import sqlite3
-import numpy as np
+import cupy as cp
 
 # ML imports
 from cuml import UMAP
 from cuml.preprocessing import StandardScaler
 from cuml.cluster.hdbscan import HDBSCAN
 from cuml.metrics.trustworthiness import trustworthiness
+import cuml
+cuml.set_global_output_type('cupy')
 
 # Optimization imports
 import optuna
@@ -151,9 +153,9 @@ def load_embeddings():
     # Initialize arrays
     paper_ids = [row[0] for row in results]
     
-    # Standardize once during initial load
+    # Pure cupy buffer conversion
+    raw_embeddings = cp.array([cp.frombuffer(row[1], dtype=cp.float32) for row in results])
     scaler = StandardScaler()
-    raw_embeddings = np.array([np.frombuffer(row[1], dtype=np.float32) for row in results])
     scaled_embeddings = scaler.fit_transform(raw_embeddings)
     
     print(f"Loaded {len(paper_ids)} papers with standardized embeddings")
@@ -181,7 +183,6 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
         print("Using pre-standardized embeddings without reduction")
         return embeddings
     
-    # Add detailed parameter print
     print(f"\nPerforming {n_components}D UMAP reduction with parameters:")
     print(f"n_neighbors: {n_neighbors}, min_dist: {min_dist}")
     
@@ -190,7 +191,8 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
         n_neighbors=n_neighbors,
         min_dist=min_dist,
         metric='cosine',
-        verbose=True
+        verbose=True,
+        output_type='cupy'
     )
     result = reducer.fit_transform(embeddings)
     print(f"UMAP reduction complete. Output shape: {result.shape}")
@@ -213,7 +215,7 @@ def save_umap_run(paper_ids, embeddings, n_components, n_neighbors, min_dist):
             cursor.execute('''
                 INSERT INTO umap_results (run_id, paper_id, embedding)
                 VALUES (?, ?, ?)
-            ''', (run_id, pid, emb.astype(np.float32).tobytes()))
+            ''', (run_id, pid, emb.astype(cp.float32).get().tobytes()))
         
         conn.commit()
         print(f"Saved UMAP run {run_id} with {len(paper_ids)} entries")
@@ -238,7 +240,7 @@ def load_umap_embeddings(run_id):
         raise ValueError(f"No embeddings found for run {run_id}")
     
     paper_ids = [row[0] for row in results]
-    embeddings = np.array([np.frombuffer(row[1], dtype=np.float32) for row in results])
+    embeddings = cp.array([cp.frombuffer(row[1], dtype=cp.float32) for row in results])
     
     return embeddings, paper_ids
 
@@ -304,14 +306,16 @@ def objective(trial, embeddings):
         **hdbscan_params,
         metric='euclidean',
         prediction_data=True,
-        gen_min_span_tree=True
+        gen_min_span_tree=True,
+        output_type='cupy'
     )
     labels = clusterer.fit_predict(reduced_embeddings)
     
-    print(f"\nClustering complete. Found {len(np.unique(labels))-1} clusters "
-          f"({np.sum(labels == -1)} noise points)")
+    print(f"\nClustering complete. Found {len(cp.unique(labels))-1} clusters "
+          f"({cp.sum(labels == -1).item()} noise points)")
     
     # Calculate metrics
+    print("\nCalculating metrics...")
     if not use_umap:
         trust_score = 1.0  # Max score when using original embeddings
     else:
@@ -377,21 +381,25 @@ def analyze_hierarchy(clusterer):
     """Remove error suppression for persistence metrics"""
     persistence = clusterer.cluster_persistence_
     stats = {
-        'mean_persistence': np.mean(persistence),
-        'std_persistence': np.std(persistence)
+        'mean_persistence': cp.mean(persistence),
+        'std_persistence': cp.std(persistence)
     }
     
-    cluster_sizes = [np.sum(clusterer.labels_ == label) 
-                    for label in np.unique(clusterer.labels_) if label != -1]
+    # Get valid labels (exclude noise)
+    labels = clusterer.labels_
+    valid_mask = labels != -1
+    valid_labels = labels[valid_mask]
     
-    # Require valid clusters
-    if not cluster_sizes:
+    if valid_labels.size == 0:
         raise ValueError("No clusters found - all points labeled as noise")
     
+    # Calculate cluster sizes using bincount
+    cluster_sizes = cp.bincount(valid_labels)
+    
     stats.update({
-        'mean_cluster_size': np.mean(cluster_sizes),
-        'std_cluster_size': np.std(cluster_sizes),
-        'cluster_size_ratio': (max(cluster_sizes) / min(cluster_sizes))
+        'mean_cluster_size': cluster_sizes.mean(),
+        'std_cluster_size': cluster_sizes.std(),
+        'cluster_size_ratio': (cluster_sizes.max() / cluster_sizes.min())
     })
     
     return stats
@@ -416,18 +424,18 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
         hdbscan_params['cluster_selection_epsilon'],
         trust_score,
         dbcvi_score,
-        np.sum(clusterer.labels_ == -1) / len(clusterer.labels_),
-        len(np.unique(clusterer.labels_[clusterer.labels_ != -1])),
-        hierarchy_stats['mean_persistence'],
-        hierarchy_stats['std_persistence'],
-        hierarchy_stats.get('mean_cluster_size', 0),
-        hierarchy_stats.get('std_cluster_size', 0),
-        hierarchy_stats.get('cluster_size_ratio', 0)
+        cp.sum(clusterer.labels_ == -1).item() / len(clusterer.labels_),
+        len(cp.unique(clusterer.labels_[clusterer.labels_ != -1])),
+        hierarchy_stats['mean_persistence'].item(),
+        hierarchy_stats['std_persistence'].item(),
+        hierarchy_stats.get('mean_cluster_size', 0).item(),
+        hierarchy_stats.get('std_cluster_size', 0).item(),
+        hierarchy_stats.get('cluster_size_ratio', 0).item()
     ))
     
     run_id = cursor.lastrowid
     conn.commit()
-    print(f"Saved clustering run {run_id} with {hierarchy_stats['n_clusters']} clusters")
+    print(f"Saved clustering run {run_id} with {len(cp.unique(clusterer.labels_[clusterer.labels_ != -1]))} clusters")
     return run_id
 
 def save_cluster_hierarchy(run_id, condensed_tree):
@@ -452,7 +460,7 @@ def save_cluster_hierarchy(run_id, condensed_tree):
     conn.commit()
     print(f"Saved {count} hierarchy relationships for run {run_id}")
 
-def optimize_clustering(embeddings, n_trials=100):
+def optimize_clustering(embeddings, n_trials=50):
     """Run optimization study"""
     study = optuna.create_study(direction='minimize')
     
