@@ -181,11 +181,7 @@ def check_existing_umap_run(n_components, n_neighbors, min_dist):
     return result['run_id'] if result else None
 
 def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
-    """Use pre-scaled embeddings, only apply UMAP if needed"""
-    if n_components == 0:
-        print("Using pre-standardized embeddings without reduction")
-        return embeddings
-    
+    """Use pre-scaled embeddings, apply UMAP if needed"""
     print(f"\nPerforming {n_components}D UMAP reduction with parameters:")
     print(f"n_neighbors: {n_neighbors}, min_dist: {min_dist}")
     
@@ -312,27 +308,25 @@ def objective(trial, embeddings):
     """Optuna optimization objective function"""
     # UMAP configuration
     use_umap = trial.suggest_categorical('use_umap', [True, False])
-    umap_params = {
-        'min_dist': 0.0,
-        'n_components': 0,  # Default for no UMAP
-        'n_neighbors': 0    # Unused
-    }
+    existing_umap_id = None
+    reduced_embeddings = embeddings  # Default to original embeddings
     
     if use_umap:
-        umap_params.update({
+        umap_params = {
             'n_components': trial.suggest_int('n_components', 15, 100),
-            'n_neighbors': trial.suggest_int('n_neighbors', 30, 100)
-        })
-    
-    # Check for existing UMAP run
-    existing_umap_id = check_existing_umap_run(**umap_params)
-    
-    if existing_umap_id:
-        reduced_embeddings, _ = load_umap_embeddings(existing_umap_id)
-    else:
-        # Perform and save new UMAP reduction
-        reduced_embeddings = perform_umap_reduction(embeddings, **umap_params)
-        existing_umap_id = save_umap_run(paper_ids, reduced_embeddings, **umap_params)
+            'n_neighbors': trial.suggest_int('n_neighbors', 30, 100),
+            'min_dist': 0.0
+        }
+        
+        # Check for existing UMAP run
+        existing_umap_id = check_existing_umap_run(**umap_params)
+        
+        if existing_umap_id:
+            reduced_embeddings, _ = load_umap_embeddings(existing_umap_id)
+        else:
+            # Perform and save new UMAP reduction
+            reduced_embeddings = perform_umap_reduction(embeddings, **umap_params)
+            existing_umap_id = save_umap_run(paper_ids, reduced_embeddings, **umap_params)
 
     # HDBSCAN parameters
     min_cluster_size = trial.suggest_int('min_cluster_size', 20, 100)
