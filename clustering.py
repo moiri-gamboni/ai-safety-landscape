@@ -96,7 +96,6 @@ CREATE TABLE IF NOT EXISTS clustering_runs (
     cluster_selection_epsilon REAL,
     trust_score REAL,
     dbcvi_score REAL,
-    combined_score REAL,
     noise_ratio REAL,
     n_clusters INTEGER,
     mean_persistence REAL,
@@ -283,8 +282,8 @@ def objective(trial, embeddings):
     
     if existing_cluster_id:
         cursor = conn.cursor()
-        cursor.execute('SELECT combined_score FROM clustering_runs WHERE run_id = ?', (existing_cluster_id,))
-        return cursor.fetchone()['combined_score']
+        cursor.execute('SELECT dbcvi_score FROM clustering_runs WHERE run_id = ?', (existing_cluster_id,))
+        return cursor.fetchone()['dbcvi_score']
     
     # Perform clustering
     clusterer = HDBSCAN(
@@ -303,7 +302,6 @@ def objective(trial, embeddings):
     
     cm = ClusteringMetric(X=reduced_embeddings, y_pred=labels)
     dbcvi_score = cm.DBCVI()
-    combined_score = dbcvi_score  # Directly use DBCVI since range is [0,1]
     
     # Save results to DB
     run_id = save_optimized_run(
@@ -311,8 +309,7 @@ def objective(trial, embeddings):
         hdbscan_params,
         clusterer,
         trust_score,
-        dbcvi_score,
-        combined_score
+        dbcvi_score
     )
     
     # Store hierarchy and create visualization embedding
@@ -320,7 +317,7 @@ def objective(trial, embeddings):
     create_visualization_embedding(umap_params, existing_umap_id)
     
     trial.set_user_attr('db_run_id', run_id)  # Store actual DB ID
-    return combined_score
+    return dbcvi_score
 
 def create_visualization_embedding(umap_params, main_run_id):
     """Ensure 2D visualization embedding exists"""
@@ -379,7 +376,7 @@ def analyze_hierarchy(clusterer):
     
     return stats
 
-def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcvi_score, combined_score):
+def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcvi_score):
     """Save optimized clustering results to database"""
     cursor = conn.cursor()
     hierarchy_stats = analyze_hierarchy(clusterer)
@@ -387,9 +384,9 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
     cursor.execute('''
         INSERT INTO clustering_runs (
             umap_run_id, min_cluster_size, min_samples, cluster_selection_method, cluster_selection_epsilon,
-            trust_score, dbcvi_score, combined_score, noise_ratio, n_clusters,
+            trust_score, dbcvi_score, noise_ratio, n_clusters,
             mean_persistence, std_persistence, mean_cluster_size, std_cluster_size, cluster_size_ratio
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         umap_run_id,
         hdbscan_params['min_cluster_size'],
@@ -398,7 +395,6 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
         hdbscan_params['cluster_selection_epsilon'],
         trust_score,
         dbcvi_score,
-        combined_score,
         np.sum(clusterer.labels_ == -1) / len(clusterer.labels_),
         len(np.unique(clusterer.labels_[clusterer.labels_ != -1])),
         hierarchy_stats['mean_persistence'],
