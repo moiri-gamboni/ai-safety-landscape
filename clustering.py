@@ -357,7 +357,11 @@ def objective(trial, embeddings):
     if existing_cluster_id:
         cursor = conn.cursor()
         cursor.execute('SELECT dbcvi_score FROM clustering_runs WHERE run_id = ?', (existing_cluster_id,))
-        return cursor.fetchone()['dbcvi_score']
+        score = cursor.fetchone()['dbcvi_score']
+        
+        # Add this critical line to propagate the existing run ID
+        trial.set_user_attr('db_run_id', existing_cluster_id)
+        return score
     
     # Perform clustering
     clusterer = HDBSCAN(
