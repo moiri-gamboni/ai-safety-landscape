@@ -10,3 +10,5 @@ tenacity
 scikit-learn
 --extra-index-url https://pypi.nvidia.com
 cuml-cu12==24.12.*
+permetrics
+optuna

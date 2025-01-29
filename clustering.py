@@ -26,32 +26,33 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    # Install only the packages needed for this notebook
-    %pip install --extra-index-url=https://pypi.nvidia.com numpy scikit-learn cuml-cu12==24.12.* tqdm # pyright: ignore
+    %pip install --extra-index-url=https://pypi.nvidia.com numpy scikit-learn cuml-cu12==24.12.* tqdm optuna permetrics # pyright: ignore
 
 # Core imports
 import sqlite3
 import numpy as np
 from tqdm import tqdm
 
-# ML imports - fail fast if GPU versions aren't available
-from cuml import UMAP  # GPU-accelerated UMAP
+# ML imports
+from cuml import UMAP
 from cuml.preprocessing import StandardScaler
-from cuml.cluster.hdbscan import HDBSCAN  # GPU-accelerated HDBSCAN
-from cuml.metrics.cluster.silhouette_score import cython_silhouette_score as silhouette_score
+from cuml.cluster.hdbscan import HDBSCAN
 from cuml.metrics.trustworthiness import trustworthiness
-from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
 from scipy.spatial.distance import cdist
+
+# Optimization imports
+import optuna
+from permetrics import ClusteringMetric
 
 # %% [markdown]
 # ## 2. Database Setup
 
 # %%
-# Path to database
+# Database configuration
 db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
 local_db = "papers.db"
 
-# Copy database to local storage if needed
+# Initialize database connection
 print(f"Copying database to local storage: {local_db}")
 if not os.path.exists(local_db):
     %cp "{db_path}" {local_db} # pyright: ignore
@@ -59,21 +60,19 @@ if not os.path.exists(local_db):
 conn = sqlite3.connect(local_db)
 conn.row_factory = sqlite3.Row
 
-# Create UMAP runs table
+# Create tables
 cursor = conn.cursor()
+
+# UMAP tables
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS umap_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    -- UMAP parameters
     n_components INTEGER,
     n_neighbors INTEGER,
     min_dist REAL
-)
-''')
+)''')
 
-# Create UMAP results table
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS umap_results (
     run_id INTEGER,
@@ -82,35 +81,32 @@ CREATE TABLE IF NOT EXISTS umap_results (
     PRIMARY KEY (run_id, paper_id),
     FOREIGN KEY (run_id) REFERENCES umap_runs(run_id),
     FOREIGN KEY (paper_id) REFERENCES papers(id)
-)
-''')
+)''')
 
-# Create clustering runs table
+# Clustering tables
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS clustering_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     umap_run_id INTEGER,
-    
-    -- HDBSCAN parameters
+    is_optimal BOOLEAN DEFAULT 0,
     min_cluster_size INTEGER,
     min_samples INTEGER,
     cluster_selection_method TEXT,
-    
-    -- Metrics
-    n_clusters INTEGER,
+    cluster_selection_epsilon REAL,
+    trust_score REAL,
+    dbcvi_score REAL,
+    combined_score REAL,
     noise_ratio REAL,
-    silhouette_score REAL,
-    davies_bouldin_score REAL,
-    calinski_harabasz_score REAL,
-    avg_coherence REAL,
-    avg_separation REAL,
-    
+    n_clusters INTEGER,
+    mean_persistence REAL,
+    std_persistence REAL,
+    mean_cluster_size REAL,
+    std_cluster_size REAL,
+    cluster_size_ratio REAL,
     FOREIGN KEY (umap_run_id) REFERENCES umap_runs(run_id)
-)
-''')
+)''')
 
-# Create clustering results table
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS clustering_results (
     run_id INTEGER,
@@ -120,498 +116,354 @@ CREATE TABLE IF NOT EXISTS clustering_results (
     PRIMARY KEY (run_id, paper_id),
     FOREIGN KEY (run_id) REFERENCES clustering_runs(run_id),
     FOREIGN KEY (paper_id) REFERENCES papers(id)
-)
-''')
+)''')
 
-# Create hierarchy table
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS cluster_hierarchy (
     run_id INTEGER,
     parent_cluster_id INTEGER,
     child_cluster_id INTEGER,
-    lambda_val REAL,           -- Split level in hierarchy
-    child_size INTEGER,        -- Number of papers in child cluster
+    lambda_val REAL,
+    child_size INTEGER,
+    persistence REAL,
     PRIMARY KEY (run_id, parent_cluster_id, child_cluster_id),
     FOREIGN KEY (run_id) REFERENCES clustering_runs(run_id)
-)
-''')
+)''')
 
 conn.commit()
 
 # %% [markdown]
-# ## 3. Load Data
+# ## 3. Data Loading
 
 # %%
 def load_embeddings():
-    """Load paper embeddings from database"""
+    """Load and standardize embeddings once"""
     cursor = conn.cursor()
-    
-    print("Loading papers with embeddings...")
-    
-    # First get the total count
     cursor.execute('''
-        SELECT COUNT(*) as count
-        FROM papers
-        WHERE abstract_embedding IS NOT NULL
-          AND withdrawn = 0
-    ''')
-    total_count = cursor.fetchone()['count']
-    
-    # Now get all embeddings
-    cursor.execute('''
-        SELECT id, abstract_embedding
-        FROM papers
-        WHERE abstract_embedding IS NOT NULL
-          AND withdrawn = 0
+        SELECT id, abstract_embedding 
+        FROM papers 
+        WHERE abstract_embedding IS NOT NULL AND withdrawn = 0
     ''')
     
-    # Get first row to determine embedding dimension
-    first_row = cursor.fetchone()
-    first_embedding = np.frombuffer(first_row['abstract_embedding'], dtype=np.float32)
-    embedding_dim = len(first_embedding)
+    results = cursor.fetchall()
+    if not results:
+        raise ValueError("No embeddings found in database")
     
-    # Pre-allocate arrays
-    papers = [first_row['id']]
-    embeddings = np.empty((total_count, embedding_dim), dtype=np.float32)
-    embeddings[0] = first_embedding  # Store first embedding
+    # Initialize arrays
+    paper_ids = [row[0] for row in results]
     
-    # Load the rest
-    for i, row in enumerate(tqdm(cursor, total=total_count-1), start=1):
-        papers.append(row['id'])
-        embeddings[i] = np.frombuffer(row['abstract_embedding'], dtype=np.float32)
+    # Standardize once during initial load
+    scaler = StandardScaler()
+    raw_embeddings = np.array([np.frombuffer(row[1], dtype=np.float32) for row in results])
+    scaled_embeddings = scaler.fit_transform(raw_embeddings)
     
-    print(f"\nLoaded {len(papers)} papers with embeddings")
-    print(f"Embedding shape: {embeddings.shape}")
-    
-    return papers, embeddings
+    print(f"Loaded {len(paper_ids)} papers with standardized embeddings")
+    return paper_ids, scaled_embeddings
 
-# Load the data
 paper_ids, embeddings = load_embeddings()
 
 # %% [markdown]
-# ## 4. UMAP Reduction
-
-# %% 
-# @title UMAP Parameters {"run": "auto"}
-n_components = 4  # @param {type:"slider", min:2, max:8, step:1}
-n_neighbors = 15  # @param {type:"slider", min:5, max:50, step:5}
-min_dist = 0.05  # @param {type:"slider", min:0.01, max:0.5, step:0.05}
+# ## 4. Core Functions
 
 # %%
 def check_existing_umap_run(n_components, n_neighbors, min_dist):
-    """Check if a UMAP run with these parameters exists"""
+    """Check for existing UMAP run with matching parameters"""
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT run_id 
-        FROM umap_runs 
-        WHERE n_components = ? 
-          AND n_neighbors = ? 
-          AND min_dist = ?
+        SELECT run_id FROM umap_runs
+        WHERE n_components = ? AND n_neighbors = ? AND min_dist = ?
     ''', (n_components, n_neighbors, min_dist))
-    
     result = cursor.fetchone()
     return result['run_id'] if result else None
 
 def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
-    """Reduce dimensionality using UMAP"""
+    """Use pre-scaled embeddings, only apply UMAP if needed"""
+    if n_components == 0:
+        print("Using pre-standardized embeddings without reduction")
+        return embeddings
+    
     print(f"Performing {n_components}D UMAP reduction...")
-    
-    # Scale the embeddings
-    scaler = StandardScaler(
-        with_mean=True,  # Center the data
-        with_std=True,   # Scale to unit variance
-        copy=True        # Create a copy to avoid modifying original data
-    )
-    scaled_embeddings = scaler.fit_transform(embeddings.astype(np.float32))
-    
-    # UMAP reduction with cuML-specific parameters
     reducer = UMAP(
         n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=min_dist,
         metric='cosine',
-        init='spectral',
-        random_state=42,  # For reproducibility
-        n_epochs=None,    # Auto-select based on dataset size
-        negative_sample_rate=5,
-        transform_queue_size=4.0,
         verbose=True
     )
-    
-    reduced = reducer.fit_transform(scaled_embeddings)
-    print(f"Generated {n_components}D embeddings")
-    
-    return reduced
+    return reducer.fit_transform(embeddings)
 
 def save_umap_run(paper_ids, embeddings, n_components, n_neighbors, min_dist):
-    """Save UMAP run to database"""
+    """Save UMAP results to database"""
     cursor = conn.cursor()
-    
-    # Start transaction
     cursor.execute('BEGIN')
     
     try:
-        # Save run parameters
         cursor.execute('''
-            INSERT INTO umap_runs (
-                n_components,
-                n_neighbors,
-                min_dist
-            ) VALUES (?, ?, ?)
+            INSERT INTO umap_runs (n_components, n_neighbors, min_dist)
+            VALUES (?, ?, ?)
         ''', (n_components, n_neighbors, min_dist))
-        
         run_id = cursor.lastrowid
         
-        # Save embeddings
-        for i, paper_id in enumerate(tqdm(paper_ids, desc="Saving embeddings")):
-            # Store as float32 to match the original embeddings
-            embedding_bytes = embeddings[i].astype(np.float32).tobytes()
+        for pid, emb in zip(paper_ids, embeddings):
             cursor.execute('''
-                INSERT INTO umap_results (
-                    run_id,
-                    paper_id,
-                    embedding
-                ) VALUES (?, ?, ?)
-            ''', (run_id, paper_id, embedding_bytes))
+                INSERT INTO umap_results (run_id, paper_id, embedding)
+                VALUES (?, ?, ?)
+            ''', (run_id, pid, emb.astype(np.float32).tobytes()))
         
         conn.commit()
-        print(f"Saved UMAP run {run_id}")
         return run_id
-    except:
-        # If anything fails, rollback the transaction
+    except Exception as e:
         conn.rollback()
-        print("Failed to save UMAP run, rolling back changes")
+        print(f"Failed to save UMAP run: {e}")
         return None
 
-# Check for existing run with requested dimensions
-cluster_run_id = check_existing_umap_run(n_components, n_neighbors, min_dist)
-
-if cluster_run_id:
-    print(f"Found existing {n_components}D UMAP run: {cluster_run_id}")
-else:
-    # Perform and save nD reduction
-    reduced_nd = perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist)
-    cluster_run_id = save_umap_run(paper_ids, reduced_nd, n_components, n_neighbors, min_dist)
-
-# Check if we need a separate 2D run for visualization
-if n_components != 2:
-    viz_run_id = check_existing_umap_run(2, n_neighbors, min_dist)
-    
-    if viz_run_id:
-        print(f"Found existing 2D UMAP run: {viz_run_id}")
-    else:
-        # Perform and save 2D reduction with same parameters
-        reduced_2d = perform_umap_reduction(embeddings, 2, n_neighbors, min_dist)
-        viz_run_id = save_umap_run(paper_ids, reduced_2d, 2, n_neighbors, min_dist)
-        
-else:
-    viz_run_id = cluster_run_id
-
-# %% [markdown]
-# ### UMAP Validation
-
-# %%
-# Load the saved UMAP run for validation
-cursor = conn.cursor()
-cursor.execute('''
-    SELECT paper_id, embedding
-    FROM umap_results
-    WHERE run_id = ?
-    ORDER BY paper_id
-''', (cluster_run_id,))
-
-results = cursor.fetchall()
-reduced_embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
-
-# Check for NaN/Inf values
-if np.any(np.isnan(reduced_embeddings)) or np.any(np.isinf(reduced_embeddings)):
-    print("WARNING: UMAP produced NaN or Inf values!")
-
-# Check for degenerate cases (all points same/too close)
-distances = cdist(reduced_embeddings, reduced_embeddings)
-np.fill_diagonal(distances, np.inf)  # Ignore self-distances
-min_distances = np.min(distances, axis=1)
-
-# Calculate trustworthiness score
-trust_score = trustworthiness(
-    embeddings,
-    reduced_embeddings,
-    n_neighbors=n_neighbors,
-    metric='euclidean',
-    convert_dtype=True
-)
-
-validation_metrics = {
-    'min_distance': float(np.min(min_distances)),
-    'max_distance': float(np.max(distances)),
-    'mean_distance': float(np.mean(distances)),
-    'std_distance': float(np.std(distances)),
-    'trustworthiness': float(trust_score)
-}
-
-if validation_metrics['min_distance'] < 1e-10:
-    print("WARNING: Some points are extremely close together!")
-if validation_metrics['std_distance'] < 1e-6:
-    print("WARNING: Points might be too uniformly distributed!")
-
-print("\nUMAP Validation Metrics:")
-print(f"- Min distance between points: {validation_metrics['min_distance']:.3e}")
-print(f"- Max distance between points: {validation_metrics['max_distance']:.3f}")
-print(f"- Mean distance between points: {validation_metrics['mean_distance']:.3f}")
-print(f"- Std of distances: {validation_metrics['std_distance']:.3f}")
-print(f"- Trustworthiness score: {validation_metrics['trustworthiness']:.3f}")
-
-# %% [markdown]
-# ## 5. HDBSCAN Clustering
-
-# %%
-# @title HDBSCAN Parameters {"run": "auto"}
-min_cluster_size = 20  # @param {type:"slider", min:5, max:100, step:5}
-min_samples = 5  # @param {type:"slider", min:1, max:20, step:1}
-cluster_selection_method = "eom"  # @param ["leaf", "eom"]
-
-# %%
-def check_existing_clustering_run(umap_run_id, min_cluster_size, min_samples, cluster_selection_method):
-    """Check if a clustering run with these parameters exists"""
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT run_id 
-        FROM clustering_runs 
-        WHERE umap_run_id = ?
-          AND min_cluster_size = ? 
-          AND min_samples = ? 
-          AND cluster_selection_method = ?
-    ''', (umap_run_id, min_cluster_size, min_samples, cluster_selection_method))
-    
-    result = cursor.fetchone()
-    return result['run_id'] if result else None
-
 def load_umap_embeddings(run_id):
-    """Load UMAP embeddings from database"""
+    """Load UMAP embeddings from database for a given run"""
     cursor = conn.cursor()
-    
-    # Get paper IDs and embeddings
     cursor.execute('''
-        SELECT paper_id, embedding
-        FROM umap_results
+        SELECT paper_id, embedding 
+        FROM umap_results 
         WHERE run_id = ?
         ORDER BY paper_id
     ''', (run_id,))
     
     results = cursor.fetchall()
-    # The embeddings are stored as float32 in the database
-    embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
-    paper_ids = [r[0] for r in results]
+    if not results:
+        raise ValueError(f"No embeddings found for run {run_id}")
+    
+    paper_ids = [row[0] for row in results]
+    embeddings = np.array([np.frombuffer(row[1], dtype=np.float32) for row in results])
     
     return embeddings, paper_ids
 
-def evaluate_clustering(embeddings, reduced_embeddings, labels, probabilities):
-    """Calculate comprehensive clustering quality metrics"""
-    metrics = {}
+# %% [markdown]
+# ## 5. Optimization Setup
+
+# %%
+def objective(trial, embeddings):
+    """Optuna optimization objective function"""
+    # UMAP parameters
+    umap_params = {
+        'n_neighbors': trial.suggest_int('n_neighbors', 30, 100),
+        'min_dist': 0.0,  # Fixed for clustering
+        'n_components': trial.suggest_categorical('n_components', [0, 8, 15])  # 0 = no reduction
+    }
     
-    # Only evaluate assigned points (not noise)
-    mask = labels != -1
-    if np.sum(mask) > 1:
-        # Standard clustering metrics using cuML's silhouette score
-        metrics['silhouette'] = cython_silhouette_score(
-            reduced_embeddings[mask],
-            labels[mask],
-            metric='euclidean',
-            convert_dtype=True
-        )
-        
-        metrics['davies_bouldin'] = davies_bouldin_score(
-            reduced_embeddings[mask],
-            labels[mask]
-        )
-        metrics['calinski_harabasz'] = calinski_harabasz_score(
-            reduced_embeddings[mask],
-            labels[mask]
-        )
-        
-        # Cluster statistics
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        n_noise = np.sum(labels == -1)
-        metrics['n_clusters'] = n_clusters
-        metrics['noise_ratio'] = n_noise / len(labels)
-        metrics['avg_cluster_size'] = np.sum(mask) / n_clusters if n_clusters > 0 else 0
-        metrics['avg_probability'] = np.mean(probabilities[mask])
-        
-        # Semantic coherence using reduced embeddings
-        unique_labels = sorted(set(labels[mask]))
-        coherence_scores = []
-        separation_scores = []
-        
-        for label in unique_labels:
-            cluster_mask = labels == label
-            cluster_embeddings = reduced_embeddings[cluster_mask]
-            
-            # Calculate average pairwise similarity within cluster
-            similarities = 1 - cdist(cluster_embeddings, cluster_embeddings, metric='euclidean')
-            np.fill_diagonal(similarities, 0)  # Exclude self-similarity
-            coherence_scores.append(np.mean(similarities))
-
-            # Calculate separation from other clusters
-            other_embeddings = reduced_embeddings[~cluster_mask]
-            if len(other_embeddings) > 0:
-                between_similarities = 1 - cdist(cluster_embeddings, other_embeddings, metric='euclidean')
-                separation_scores.append(np.mean(between_similarities))
-                
-        metrics['avg_coherence'] = np.mean(coherence_scores)
-        metrics['avg_separation'] = np.mean(separation_scores) if separation_scores else 0
-
+    # Check for existing UMAP run
+    existing_umap_id = check_existing_umap_run(**umap_params)
+    
+    if existing_umap_id:
+        reduced_embeddings, _ = load_umap_embeddings(existing_umap_id)
     else:
-        # Default values for failed clustering
-        metrics.update({
-            'silhouette': 0,
-            'davies_bouldin': float('inf'),
-            'calinski_harabasz': 0,
-            'n_clusters': 0,
-            'noise_ratio': 1.0,
-            'avg_cluster_size': 0,
-            'avg_probability': 0,
-            'avg_coherence': 0,
-            'avg_separation': 0
-        })
-    
-    return metrics
+        # Perform and save new UMAP reduction
+        reduced_embeddings = perform_umap_reduction(embeddings, **umap_params)
+        existing_umap_id = save_umap_run(paper_ids, reduced_embeddings, **umap_params)
 
-def save_clustering_run(umap_run_id, paper_ids, labels, probabilities, metrics, clusterer):
-    """Save clustering results to database"""
-    cursor = conn.cursor()
+    # HDBSCAN parameters
+    min_cluster_size = trial.suggest_int('min_cluster_size', 20, 100)
+    hdbscan_params = {
+        'min_cluster_size': min_cluster_size,
+        'min_samples': trial.suggest_int('min_samples', 5, min_cluster_size//2),
+        'cluster_selection_method': trial.suggest_categorical('cluster_selection_method', ['eom', 'leaf']),
+        'cluster_selection_epsilon': trial.suggest_float('cluster_selection_epsilon', 0.0, 0.2)
+    }
     
-    # Start transaction
-    cursor.execute('BEGIN')
-    
-    try:
-        # Save run parameters and metrics
-        cursor.execute('''
-            INSERT INTO clustering_runs (
-                umap_run_id,
-                min_cluster_size,
-                min_samples,
-                cluster_selection_method,
-                n_clusters,
-                noise_ratio,
-                silhouette_score,
-                davies_bouldin_score,
-                calinski_harabasz_score,
-                avg_coherence,
-                avg_separation
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            umap_run_id,
-            min_cluster_size,
-            min_samples,
-            cluster_selection_method,
-            metrics['n_clusters'],
-            metrics['noise_ratio'],
-            metrics['silhouette'],
-            metrics['davies_bouldin'],
-            metrics['calinski_harabasz'],
-            metrics['avg_coherence'],
-            metrics['avg_separation']
-        ))
-        
-        run_id = cursor.lastrowid
-        
-        # Save hierarchical structure
-        print("Saving hierarchical structure...")
-        tree = clusterer.condensed_tree_
-        for row in tqdm(tree.itertuples(), desc="Saving hierarchy"):
-            if row.child_size > 1:  # Skip individual points
-                cursor.execute('''
-                    INSERT INTO cluster_hierarchy (
-                        run_id,
-                        parent_cluster_id,
-                        child_cluster_id,
-                        lambda_val,
-                        child_size
-                    ) VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    run_id,
-                    int(row.parent),
-                    int(row.child),
-                    float(row.lambda_val),
-                    int(row.child_size)
-                ))
-        
-        # Save paper results
-        print("Saving paper assignments...")
-        for i, paper_id in enumerate(tqdm(paper_ids, desc="Saving results")):
-            cursor.execute('''
-                INSERT INTO clustering_results (
-                    run_id,
-                    paper_id,
-                    cluster_id,
-                    cluster_prob
-                ) VALUES (?, ?, ?, ?)
-            ''', (
-                run_id,
-                paper_id,
-                int(labels[i]),
-                float(probabilities[i])
-            ))
-        
-        # Commit all changes
-        conn.commit()
-        print(f"Saved clustering run {run_id}")
-        return run_id
-    except:
-        # If anything fails, rollback the transaction
-        conn.rollback()
-        print("Failed to save clustering run, rolling back changes")
-        return None
-
-# Check for existing run
-existing_run_id = check_existing_clustering_run(cluster_run_id, min_cluster_size, min_samples, cluster_selection_method)
-
-if existing_run_id:
-    print(f"Found existing clustering run: {existing_run_id}")
-else:
-    # Load UMAP embeddings
-    reduced_embeddings, paper_ids = load_umap_embeddings(cluster_run_id)
-    
-    # Initialize clusterer
-    reduced_embeddings = reduced_embeddings.astype(np.float32)
-    clusterer = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        metric='euclidean',
-        cluster_selection_method=cluster_selection_method,
-        prediction_data=True,  # Enable prediction capabilities
-        gen_min_span_tree=True,  # Required for visualization
-        verbose=True
+    # Check for existing clustering run
+    existing_cluster_id = check_existing_clustering_run(
+        umap_run_id=existing_umap_id,
+        **hdbscan_params
     )
     
+    if existing_cluster_id:
+        cursor = conn.cursor()
+        cursor.execute('SELECT combined_score FROM clustering_runs WHERE run_id = ?', (existing_cluster_id,))
+        return cursor.fetchone()['combined_score']
+    
     # Perform clustering
-    print("Performing HDBSCAN clustering...")
+    clusterer = HDBSCAN(
+        **hdbscan_params,
+        metric='euclidean',
+        prediction_data=True,
+        gen_min_span_tree=True
+    )
     labels = clusterer.fit_predict(reduced_embeddings)
-    probabilities = clusterer.probabilities_
     
-    # Evaluate results
-    metrics = evaluate_clustering(embeddings, reduced_embeddings, labels, probabilities)
+    # Calculate metrics
+    if umap_params['n_components'] == 0:
+        trust_score = 1.0  # Max score when using original embeddings
+    else:
+        trust_score = trustworthiness(embeddings, reduced_embeddings)
     
-    # Print clustering statistics
-    print("\nClustering Results:")
-    print(f"- Number of clusters: {metrics['n_clusters']}")
-    print(f"- Noise points: {metrics['noise_ratio']*100:.1f}%")
-    print(f"- Average cluster size: {metrics['avg_cluster_size']:.1f}")
-    print(f"- Average cluster probability: {metrics['avg_probability']:.3f}")
-    print(f"\nQuality Metrics:")
-    print(f"- Silhouette Score: {metrics['silhouette']:.3f}")
-    print(f"- Davies-Bouldin Index: {metrics['davies_bouldin']:.3f}")
-    print(f"- Calinski-Harabasz Index: {metrics['calinski_harabasz']:.3f}")
-    print(f"- Average Semantic Coherence: {metrics['avg_coherence']:.3f}")
-    print(f"- Average Cluster Separation: {metrics['avg_separation']:.3f}")
+    cm = ClusteringMetric(X=reduced_embeddings, y_pred=labels)
+    dbcvi_score = cm.DBCVI()
+    combined_score = 1 - dbcvi_score  # Directly use DBCVI since range is [0,1]
     
-    # Save results
-    run_id = save_clustering_run(cluster_run_id, paper_ids, labels, probabilities, metrics, clusterer)
+    # Save results to DB
+    run_id = save_optimized_run(
+        existing_umap_id,
+        hdbscan_params,
+        clusterer,
+        trust_score,
+        dbcvi_score,
+        combined_score
+    )
+    
+    # Store hierarchy and create visualization embedding
+    save_cluster_hierarchy(run_id, clusterer.condensed_tree_)
+    create_visualization_embedding(umap_params, existing_umap_id)
+    
+    trial.set_user_attr('db_run_id', run_id)  # Store actual DB ID
+    return combined_score
+
+def create_visualization_embedding(umap_params, main_run_id):
+    """Ensure 2D visualization embedding exists"""
+    if umap_params['n_components'] == 2:
+        return
+    
+    viz_params = umap_params.copy()
+    viz_params['n_components'] = 2
+    viz_run_id = check_existing_umap_run(**viz_params)
+    
+    if not viz_run_id:
+        print("Creating 2D visualization embedding...")
+        viz_embeddings = perform_umap_reduction(embeddings, **viz_params)
+        viz_run_id = save_umap_run(paper_ids, viz_embeddings, **viz_params)
+
+def check_existing_clustering_run(umap_run_id, **hdbscan_params):
+    """Check for existing clustering run with these parameters"""
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT run_id FROM clustering_runs
+        WHERE umap_run_id = ?
+        AND min_cluster_size = ?
+        AND min_samples = ?
+        AND cluster_selection_method = ?
+        AND cluster_selection_epsilon = ?
+    ''', (
+        umap_run_id,
+        hdbscan_params['min_cluster_size'],
+        hdbscan_params['min_samples'],
+        hdbscan_params['cluster_selection_method'],
+        hdbscan_params['cluster_selection_epsilon']
+    ))
+    result = cursor.fetchone()
+    return result['run_id'] if result else None
+
+def analyze_hierarchy(clusterer):
+    """Remove error suppression for persistence metrics"""
+    persistence = clusterer.cluster_persistence_
+    stats = {
+        'mean_persistence': np.mean(persistence),
+        'std_persistence': np.std(persistence)
+    }
+    
+    cluster_sizes = [np.sum(clusterer.labels_ == label) 
+                    for label in np.unique(clusterer.labels_) if label != -1]
+    
+    # Require valid clusters
+    if not cluster_sizes:
+        raise ValueError("No clusters found - all points labeled as noise")
+    
+    stats.update({
+        'mean_cluster_size': np.mean(cluster_sizes),
+        'std_cluster_size': np.std(cluster_sizes),
+        'cluster_size_ratio': (max(cluster_sizes) / min(cluster_sizes))
+    })
+    
+    return stats
+
+def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcvi_score, combined_score):
+    """Save optimized clustering results to database"""
+    cursor = conn.cursor()
+    hierarchy_stats = analyze_hierarchy(clusterer)
+    
+    cursor.execute('''
+        INSERT INTO clustering_runs (
+            umap_run_id, min_cluster_size, min_samples, cluster_selection_method, cluster_selection_epsilon,
+            trust_score, dbcvi_score, combined_score, noise_ratio, n_clusters,
+            mean_persistence, std_persistence, mean_cluster_size, std_cluster_size, cluster_size_ratio
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        umap_run_id,
+        hdbscan_params['min_cluster_size'],
+        hdbscan_params['min_samples'],
+        hdbscan_params['cluster_selection_method'],
+        hdbscan_params['cluster_selection_epsilon'],
+        trust_score,
+        dbcvi_score,
+        combined_score,
+        np.sum(clusterer.labels_ == -1) / len(clusterer.labels_),
+        len(np.unique(clusterer.labels_[clusterer.labels_ != -1])),
+        hierarchy_stats['mean_persistence'],
+        hierarchy_stats['std_persistence'],
+        hierarchy_stats.get('mean_cluster_size', 0),
+        hierarchy_stats.get('std_cluster_size', 0),
+        hierarchy_stats.get('cluster_size_ratio', 0)
+    ))
+    
+    run_id = cursor.lastrowid
+    conn.commit()
+    return run_id
+
+def save_cluster_hierarchy(run_id, condensed_tree):
+    """Save cluster hierarchy data"""
+    cursor = conn.cursor()
+    for row in condensed_tree.itertuples():
+        if row.child_size > 1:
+            cursor.execute('''
+                INSERT INTO cluster_hierarchy
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                run_id,
+                int(row.parent),
+                int(row.child),
+                float(row.lambda_val),
+                int(row.child_size),
+                float(row.persistence)
+            ))
+    conn.commit()
+
+def optimize_clustering(embeddings, n_trials=100):
+    """Run optimization study"""
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5)
+    )
+    
+    study.optimize(
+        lambda trial: objective(trial, embeddings),
+        n_trials=n_trials,
+        catch=(Exception,)
+    )
+    
+    # Fix best run marking
+    best_run_id = study.best_trial.user_attrs['db_run_id']
+    cursor = conn.cursor()
+    cursor.execute('UPDATE clustering_runs SET is_optimal = 1 WHERE run_id = ?', 
+                  (best_run_id,))
+    conn.commit()
+    
+    print(f"\nBest trial ({study.best_trial.number}):")
+    print(f"Score: {study.best_trial.value:.3f}")
+    print("Parameters:", study.best_trial.params)
+    
+    return study
 
 # %% [markdown]
-# ## 6. Database Backup
+# ## 6. Run Optimization
+
+# %%
+if __name__ == '__main__':
+    study = optimize_clustering(embeddings, n_trials=100)
+    print("Optimization complete! Best parameters saved to database.")
+
+# %% [markdown]
+# ## 7. Database Backup
 
 # %%
 # Copy updated database back to Drive
 %cp {local_db} "{db_path}" # pyright: ignore
 print("Database backup completed to Google Drive")
+
+
