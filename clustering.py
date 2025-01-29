@@ -454,30 +454,47 @@ def save_cluster_hierarchy(run_id, condensed_tree):
 
 def optimize_clustering(embeddings, n_trials=100):
     """Run optimization study"""
-    study = optuna.create_study(
-        direction='minimize'
-    )
+    study = optuna.create_study(direction='minimize')
     
-    # Add logging callback
-    def log_trial(study, trial):
+    # Track best run across all trials
+    best_score = float('inf')
+    best_run_id = None
+    
+    def log_and_update_best(study, trial):
+        """Enhanced callback with continuous best run tracking"""
+        nonlocal best_score, best_run_id
+        
         print(f"\nTrial {trial.number} finished:")
         print(f"Params: {trial.params}")
         print(f"Value: {trial.value:.3f}")
+        
+        # Update best run if improved
+        current_best = study.best_trial
+        if current_best.value < best_score:
+            best_score = current_best.value
+            new_best_id = current_best.user_attrs['db_run_id']
+            
+            if new_best_id != best_run_id:
+                print(f"New best run found! Updating marker to run {new_best_id}")
+                cursor = conn.cursor()
+                # Clear previous optimal marker
+                cursor.execute('UPDATE clustering_runs SET is_optimal = 0')
+                # Set new optimal marker
+                cursor.execute('''
+                    UPDATE clustering_runs 
+                    SET is_optimal = 1 
+                    WHERE run_id = ?
+                ''', (new_best_id,))
+                conn.commit()
+                best_run_id = new_best_id
     
     study.optimize(
         lambda trial: objective(trial, embeddings),
         n_trials=n_trials,
-        callbacks=[log_trial]
+        callbacks=[log_and_update_best]  # Use enhanced callback
     )
     
-    # Fix best run marking
-    best_run_id = study.best_trial.user_attrs['db_run_id']
-    cursor = conn.cursor()
-    cursor.execute('UPDATE clustering_runs SET is_optimal = 1 WHERE run_id = ?', 
-                  (best_run_id,))
-    conn.commit()
-    
-    print(f"\nBest trial ({study.best_trial.number}):")
+    print(f"\nFinal best trial ({study.best_trial.number}):")
     print(f"Score: {study.best_trial.value:.3f}")
     print("Parameters:", study.best_trial.params)
     
