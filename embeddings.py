@@ -81,6 +81,10 @@ if 'abstract_embedding' not in columns:
         ALTER TABLE papers 
         ADD COLUMN abstract_embedding BLOB
     ''')
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_abstract_embedding 
+        ON papers(abstract_embedding)
+    ''')
     conn.commit()
 
 # %% [markdown]
