@@ -402,7 +402,7 @@ def objective(trial, embeddings):
     
     # Only create visualization embedding if we used UMAP
     if use_umap:
-        create_visualization_embedding(existing_umap_id)
+        create_visualization_embedding(umap_params, existing_umap_id)
     
     trial.set_user_attr('db_run_id', run_id)  # Store actual DB ID
     return dbcvi_score
