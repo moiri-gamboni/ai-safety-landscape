@@ -46,6 +46,10 @@ cuml.set_global_output_type('cupy')
 # Optimization imports
 import optuna
 
+# Locale fix after install https://github.com/googlecolab/colabtools/issues/3409
+import locale
+locale.getpreferredencoding = lambda: "UTF-8"
+
 # %% [markdown]
 # ## 2. Database Setup
 
