@@ -50,6 +50,9 @@ import optuna
 import locale
 locale.getpreferredencoding = lambda: "UTF-8"
 
+# Add to Core imports
+from cuml.neighbors import NearestNeighbors
+
 # %% [markdown]
 # ## 2. Database Setup
 
@@ -141,7 +144,7 @@ conn.commit()
 
 # %%
 def load_embeddings():
-    """Load and standardize embeddings once"""
+    """Load embeddings and precompute k-NN graph"""
     cursor = conn.cursor()
     cursor.execute('''
         SELECT id, abstract_embedding 
@@ -161,10 +164,16 @@ def load_embeddings():
     scaler = StandardScaler()
     scaled_embeddings = scaler.fit_transform(raw_embeddings)
     
-    print(f"Loaded {len(paper_ids)} papers with standardized embeddings")
-    return paper_ids, scaled_embeddings
+    # Precompute k-NN graph with max neighbors needed
+    print("Precomputing k-NN graph for UMAP...")
+    nn_model = NearestNeighbors(n_neighbors=100, metric='cosine')
+    nn_model.fit(scaled_embeddings)
+    knn_graph = nn_model.kneighbors_graph(scaled_embeddings, mode='distance')
+    
+    print(f"Precomputed {knn_graph.shape[1]} neighbors for each sample")
+    return paper_ids, scaled_embeddings, knn_graph
 
-paper_ids, embeddings = load_embeddings()
+paper_ids, embeddings, knn_graph = load_embeddings()
 
 # %% [markdown]
 # ## 4. Core Functions
@@ -180,15 +189,20 @@ def check_existing_umap_run(n_components, n_neighbors, min_dist):
     result = cursor.fetchone()
     return result['run_id'] if result else None
 
-def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
-    """Use pre-scaled embeddings, apply UMAP if needed"""
+def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist, knn_graph):
+    """UMAP using precomputed k-NN graph"""
     print(f"\nPerforming {n_components}D UMAP reduction with parameters:")
     print(f"n_neighbors: {n_neighbors}, min_dist: {min_dist}")
+    
+    # Validate neighbor count
+    if n_neighbors > knn_graph.shape[1]:
+        raise ValueError(f"Requested {n_neighbors} neighbors exceeds precomputed {knn_graph.shape[1]}")
     
     reducer = UMAP(
         n_components=n_components,
         n_neighbors=n_neighbors,
         min_dist=min_dist,
+        precomputed_knn=knn_graph,
         metric='cosine',
         output_type='cupy'
     )
@@ -304,18 +318,19 @@ def compute_relative_validity(minimum_spanning_tree, labels):
     weighted_V = (cluster_sizes * V_index) / total
     return float(np.sum(weighted_V))
 
-def objective(trial, embeddings):
+def objective(trial, embeddings, knn_graph):
     """Optuna optimization objective function"""
     # UMAP configuration
     use_umap = trial.suggest_categorical('use_umap', [True, False])
     existing_umap_id = None
-    reduced_embeddings = embeddings  # Default to original embeddings
+    reduced_embeddings = embeddings
     
     if use_umap:
         umap_params = {
             'n_components': trial.suggest_int('n_components', 15, 100),
             'n_neighbors': trial.suggest_int('n_neighbors', 30, 100),
-            'min_dist': 0.0
+            'min_dist': 0.0,
+            'knn_graph': knn_graph
         }
         
         # Check for existing UMAP run
@@ -523,7 +538,7 @@ def save_cluster_hierarchy(run_id, condensed_tree):
     conn.commit()
     print(f"Saved {len(meaningful_edges)} hierarchy relationships for run {run_id}")
 
-def optimize_clustering(embeddings, n_trials=50):
+def optimize_clustering(embeddings, knn_graph, n_trials=50):
     """Run optimization study"""
     study = optuna.create_study(direction='maximize')
     
@@ -558,7 +573,7 @@ def optimize_clustering(embeddings, n_trials=50):
                 best_run_id = new_best_id
     
     study.optimize(
-        lambda trial: objective(trial, embeddings),
+        lambda trial: objective(trial, embeddings, knn_graph),
         n_trials=n_trials,
         callbacks=[log_and_update_best]  # Use enhanced callback
     )
@@ -573,7 +588,7 @@ def optimize_clustering(embeddings, n_trials=50):
 # ## 6. Run Optimization
 
 # %%
-study = optimize_clustering(embeddings, n_trials=50)
+study = optimize_clustering(embeddings, knn_graph, n_trials=50)
 print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
