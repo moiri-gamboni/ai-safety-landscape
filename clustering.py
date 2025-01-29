@@ -375,7 +375,7 @@ def objective(trial, embeddings):
     # Calculate metrics
     print("\nCalculating trustworthiness...")
     if not use_umap:
-        trust_score = 1.0  # Max score when using original embeddings
+        trust_score = None
     else:
         trust_score = trustworthiness(embeddings, reduced_embeddings)
     
