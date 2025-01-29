@@ -181,7 +181,10 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
         print("Using pre-standardized embeddings without reduction")
         return embeddings
     
-    print(f"Performing {n_components}D UMAP reduction...")
+    # Add detailed parameter print
+    print(f"\nPerforming {n_components}D UMAP reduction with parameters:")
+    print(f"n_neighbors: {n_neighbors}, min_dist: {min_dist}")
+    
     reducer = UMAP(
         n_components=n_components,
         n_neighbors=n_neighbors,
@@ -189,10 +192,13 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist):
         metric='cosine',
         verbose=True
     )
-    return reducer.fit_transform(embeddings)
+    result = reducer.fit_transform(embeddings)
+    print(f"UMAP reduction complete. Output shape: {result.shape}")
+    return result
 
 def save_umap_run(paper_ids, embeddings, n_components, n_neighbors, min_dist):
     """Save UMAP results to database"""
+    print(f"\nSaving UMAP results to database (n={len(paper_ids)})...")
     cursor = conn.cursor()
     cursor.execute('BEGIN')
     
@@ -210,6 +216,7 @@ def save_umap_run(paper_ids, embeddings, n_components, n_neighbors, min_dist):
             ''', (run_id, pid, emb.astype(np.float32).tobytes()))
         
         conn.commit()
+        print(f"Saved UMAP run {run_id} with {len(paper_ids)} entries")
         return run_id
     except Exception as e:
         conn.rollback()
@@ -274,6 +281,13 @@ def objective(trial, embeddings):
         'cluster_selection_epsilon': trial.suggest_float('cluster_selection_epsilon', 0.0, 0.5)
     }
     
+    # Add HDBSCAN parameter print
+    print("\nUsing HDBSCAN parameters:")
+    print(f"min_cluster_size: {hdbscan_params['min_cluster_size']}")
+    print(f"min_samples: {hdbscan_params['min_samples']}")
+    print(f"cluster_selection_method: {hdbscan_params['cluster_selection_method']}")
+    print(f"cluster_selection_epsilon: {hdbscan_params['cluster_selection_epsilon']}")
+    
     # Check for existing clustering run
     existing_cluster_id = check_existing_clustering_run(
         umap_run_id=existing_umap_id,
@@ -293,6 +307,9 @@ def objective(trial, embeddings):
         gen_min_span_tree=True
     )
     labels = clusterer.fit_predict(reduced_embeddings)
+    
+    print(f"\nClustering complete. Found {len(np.unique(labels))-1} clusters "
+          f"({np.sum(labels == -1)} noise points)")
     
     # Calculate metrics
     if not use_umap:
@@ -328,10 +345,13 @@ def create_visualization_embedding(umap_params, main_run_id):
     viz_params['n_components'] = 2
     viz_run_id = check_existing_umap_run(**viz_params)
     
-    if not viz_run_id:
-        print("Creating 2D visualization embedding...")
+    if viz_run_id:
+        print(f"Using existing 2D visualization embedding (run {viz_run_id})")
+    else:
+        print("\nCreating new 2D visualization embedding...")
         viz_embeddings = perform_umap_reduction(embeddings, **viz_params)
         viz_run_id = save_umap_run(paper_ids, viz_embeddings, **viz_params)
+        print(f"Created 2D visualization embedding (run {viz_run_id})")
 
 def check_existing_clustering_run(umap_run_id, **hdbscan_params):
     """Check for existing clustering run with these parameters"""
@@ -378,6 +398,7 @@ def analyze_hierarchy(clusterer):
 
 def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcvi_score):
     """Save optimized clustering results to database"""
+    print("\nSaving clustering metrics to database...")
     cursor = conn.cursor()
     hierarchy_stats = analyze_hierarchy(clusterer)
     
@@ -406,13 +427,17 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
     
     run_id = cursor.lastrowid
     conn.commit()
+    print(f"Saved clustering run {run_id} with {hierarchy_stats['n_clusters']} clusters")
     return run_id
 
 def save_cluster_hierarchy(run_id, condensed_tree):
     """Save cluster hierarchy data"""
+    print("\nSaving cluster hierarchy relationships...")
     cursor = conn.cursor()
+    count = 0
     for row in condensed_tree.itertuples():
         if row.child_size > 1:
+            count += 1
             cursor.execute('''
                 INSERT INTO cluster_hierarchy
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -425,6 +450,7 @@ def save_cluster_hierarchy(run_id, condensed_tree):
                 float(row.persistence)
             ))
     conn.commit()
+    print(f"Saved {count} hierarchy relationships for run {run_id}")
 
 def optimize_clustering(embeddings, n_trials=100):
     """Run optimization study"""
@@ -469,7 +495,8 @@ print("Optimization complete! Best parameters saved to database.")
 
 # %%
 # Copy updated database back to Drive
+print("\nStarting database backup to Google Drive...")
 %cp {local_db} "{db_path}" # pyright: ignore
-print("Database backup completed to Google Drive")
+print("Backup completed successfully")
 
 
