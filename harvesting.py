@@ -29,8 +29,14 @@
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    # Install only the packages needed for this notebook
-    %pip install sickle tqdm # pyright: ignore
+    # Install and configure PostgreSQL
+    !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
+    !sudo service postgresql start # pyright: ignore
+    !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
+    !sudo service postgresql restart # pyright: ignore
+    
+    # Install Python client
+    %pip install psycopg2-binary # pyright: ignore
 
 # %% [markdown]
 # ## 1.2 Database Initialization
@@ -42,27 +48,17 @@ db_choice = "create_new" # @param ["create_new", "load_existing"] {type:"string"
 
 import sqlite3
 import os
+import psycopg2
 
 def load_existing_database():
-    """Load existing database from Google Drive"""
-    # Mount Google Drive
-    from google.colab import drive # pyright: ignore [reportMissingImports]
-    drive.mount('/content/drive')
-
-    # Check if database exists in Drive
-    db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
-    if not os.path.exists(db_path):
-        raise FileNotFoundError(f"No database found at {db_path}")
-        
-    print(f"Found existing database at {db_path}")
-    %cp "{db_path}" papers.db # pyright: ignore
-    
-    # Connect and print summary
-    conn = sqlite3.connect('papers.db')
-    c = conn.cursor()
-    c.execute('SELECT COUNT(*) FROM papers')
-    print(f"Database contains {c.fetchone()[0]} papers")
-    return conn
+    """Load existing PostgreSQL database from backup"""
+    print("Loading PostgreSQL backup...")
+    !pg_restore -h localhost -U postgres -d {postgres_db} -c -F c "{backup_path}"  # pyright: ignore
+    return psycopg2.connect(
+        host='',
+        database="postgres",
+        user="postgres"
+    )
 
 def create_new_database():
     """Create a new empty database with schema"""
@@ -91,76 +87,101 @@ import sqlite3
 import os
 
 def create_database():
-    """Create SQLite database with necessary tables"""
-    conn = sqlite3.connect('papers.db')
-    c = conn.cursor()
+    """Create PostgreSQL database matching migration script"""
+    # Create/maintain database connection
+    conn = psycopg2.connect(
+        host='',
+        database="postgres",
+        user="postgres"
+    )
+    conn.autocommit = True  # Needed for database creation
     
-    # Print SQLite variable limit
-    max_vars = get_sqlite_variable_limit(conn)
-    print(f"SQLite max variables per query: {max_vars}")
+    try:
+        with conn.cursor() as cursor:
+            # Create database if not exists
+            cursor.execute("CREATE DATABASE postgres")
+    except psycopg2.errors.DuplicateDatabase:
+        pass
     
-    # Create papers table with all arXiv metadata fields
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS papers (
-            id TEXT PRIMARY KEY,           -- Required, maxOccurs=1
-            title TEXT,                    -- Optional, maxOccurs=1
-            abstract TEXT,                 -- Optional, maxOccurs=1
-            categories TEXT,               -- Optional, maxOccurs=1
-            msc_class TEXT,                -- Optional, maxOccurs=1
-            acm_class TEXT,                -- Optional, maxOccurs=1
-            doi TEXT,                      -- Optional, maxOccurs=1
-            license TEXT,                  -- Optional, maxOccurs=1
-            comments TEXT,                 -- Optional, maxOccurs=1
-            created TEXT,                  -- Date of first version
-            updated TEXT,                  -- Date of latest version
-            withdrawn BOOLEAN DEFAULT 0,    -- Indicates if paper is withdrawn
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    # Connect to the new database
+    conn = psycopg2.connect(
+        host='',
+        database="postgres",
+        user="postgres"
+    )
     
-    # Create paper versions table to track version history
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS paper_versions (
-            paper_id TEXT,
-            version INTEGER,
-            source_type TEXT,              -- D for Document, I for Inactive
-            size TEXT,                     -- Size in kb
-            date TEXT,                     -- Submission date of this version
-            PRIMARY KEY (paper_id, version),
-            FOREIGN KEY (paper_id) REFERENCES papers(id)
-        )
-    ''')
-    
-    # Create authors table matching arXiv schema
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS authors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            keyname TEXT NOT NULL,          -- Required, maxOccurs=1
-            forenames TEXT,                 -- Optional, maxOccurs=1
-            suffix TEXT,                    -- Optional, maxOccurs=1
-            UNIQUE(keyname, forenames, suffix)  -- Avoid duplicate authors
-        )
-    ''')
-    
-    # Create paper_authors junction table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS paper_authors (
-            paper_id TEXT,
-            author_id INTEGER,
-            author_position INTEGER,        -- Track author order in paper
-            PRIMARY KEY (paper_id, author_id),
-            FOREIGN KEY (paper_id) REFERENCES papers(id),
-            FOREIGN KEY (author_id) REFERENCES authors(id)
-        )
-    ''')
-    
-    # Create indices for common queries after all tables are created
-    c.execute("CREATE INDEX IF NOT EXISTS idx_categories ON papers(categories)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_withdrawn ON papers(withdrawn)")
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_authors_unique ON authors(keyname, forenames, suffix)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_created ON papers(created)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_updated ON papers(updated)")
-    
+    with conn.cursor() as cursor:
+        # Create tables with PostgreSQL data types
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS papers (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                abstract TEXT,
+                categories TEXT,
+                msc_class TEXT,
+                acm_class TEXT,
+                doi TEXT,
+                license TEXT,
+                comments TEXT,
+                created TIMESTAMP,
+                updated TIMESTAMP,
+                withdrawn BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                abstract_embedding BYTEA
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS paper_versions (
+                paper_id TEXT,
+                version INTEGER,
+                source_type TEXT,
+                size TEXT,
+                date TIMESTAMP,
+                PRIMARY KEY (paper_id, version),
+                FOREIGN KEY (paper_id) REFERENCES papers(id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS authors (
+                id SERIAL PRIMARY KEY,
+                keyname TEXT NOT NULL,
+                forenames TEXT,
+                suffix TEXT,
+                CONSTRAINT unique_author UNIQUE (keyname, forenames, suffix)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS paper_authors (
+                paper_id TEXT,
+                author_id INTEGER,
+                author_position INTEGER,
+                PRIMARY KEY (paper_id, author_id),
+                FOREIGN KEY (paper_id) REFERENCES papers(id),
+                FOREIGN KEY (author_id) REFERENCES authors(id)
+            )
+        ''')
+        
+        # Create indexes
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_categories 
+            ON papers(categories)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_withdrawn 
+            ON papers(withdrawn)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_created 
+            ON papers(created)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_updated 
+            ON papers(updated)
+        ''')
+        
     conn.commit()
     return conn
 
@@ -199,30 +220,9 @@ from tqdm import tqdm
 import urllib.parse
 import re
 
-def get_sqlite_variable_limit(conn):
-    """Get the maximum number of variables allowed in a SQLite query"""
-    c = conn.cursor()
-    c.execute('PRAGMA compile_options')
-    compile_options = c.fetchall()
-    for option in compile_options:
-        if 'MAX_VARIABLE_NUMBER=' in option[0]:
-            return int(option[0].split('=')[1])
-    return 999  # Default SQLite limit if not found
-
-def get_safe_batch_size(conn, vars_per_item=1):
-    """Calculate a safe batch size based on SQLite's variable limit
-    
-    Args:
-        conn: SQLite connection
-        vars_per_item: Number of variables needed per item in a batch
-        
-    Returns:
-        int: Safe batch size that won't exceed SQLite's variable limit
-    """
-    max_vars = get_sqlite_variable_limit(conn)
-    # Use 90% of the limit to be safe
-    safe_vars = int(max_vars * 0.9)
-    return safe_vars // vars_per_item
+def get_safe_batch_size(conn):
+    """PostgreSQL can handle large batches"""
+    return 1000  # Conservative estimate
 
 class ArxivRecord(Record):
     """Custom record class for arXiv metadata format"""
@@ -360,10 +360,11 @@ def save_papers(papers, conn):
             try:
                 # Insert paper with all fields
                 c.execute('''
-                    INSERT OR IGNORE INTO papers (
+                    INSERT INTO papers (
                         id, title, abstract, categories,
                         msc_class, acm_class, doi, license, comments
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
                 ''', (
                     paper['id'], 
                     paper.get('title'),
@@ -386,9 +387,9 @@ def save_papers(papers, conn):
                     # First try to find existing author with normalized fields
                     c.execute('''
                         SELECT id FROM authors 
-                        WHERE keyname = ? AND 
-                              COALESCE(forenames, '') = ? AND
-                              COALESCE(suffix, '') = COALESCE(?, '')
+                        WHERE keyname = %s AND 
+                              COALESCE(forenames, '') = %s AND
+                              COALESCE(suffix, '') = COALESCE(%s, '')
                     ''', (
                         keyname,
                         forenames,
@@ -402,7 +403,7 @@ def save_papers(papers, conn):
                         # Insert new author with normalized fields
                         c.execute('''
                             INSERT INTO authors (keyname, forenames, suffix)
-                            VALUES (?, ?, ?)
+                            VALUES (%s, %s, %s)
                         ''', (
                             keyname,
                             forenames if forenames else None,  # Store NULL if empty
@@ -412,8 +413,8 @@ def save_papers(papers, conn):
                     
                     # Create paper-author relationship
                     c.execute('''
-                        INSERT OR IGNORE INTO paper_authors (paper_id, author_id, author_position)
-                        VALUES (?, ?, ?)
+                        INSERT INTO paper_authors (paper_id, author_id, author_position)
+                        VALUES (%s, %s, %s)
                     ''', (paper['id'], author_id, pos))
                 
                 pbar.update(1)
@@ -429,12 +430,9 @@ def save_versions(paper_versions, conn):
     c = conn.cursor()
     
     # Calculate batch sizes
-    VERSION_BATCH_SIZE = get_safe_batch_size(conn, vars_per_item=5)  # 5 vars per version
-    PAPER_UPDATE_BATCH_SIZE = get_safe_batch_size(conn, vars_per_item=4)  # 4 vars per paper update
-    
-    print(f"Using batch sizes:")
-    print(f"- Versions: {VERSION_BATCH_SIZE}")
-    print(f"- Paper Updates: {PAPER_UPDATE_BATCH_SIZE}")
+
+    batch_size = 1000
+
     
     # Prepare batch data
     paper_updates = []
@@ -446,7 +444,7 @@ def save_versions(paper_versions, conn):
         paper_id = paper['id']
         if 'versions' in paper:
             # Only keep versions for papers that exist
-            c.execute('SELECT 1 FROM papers WHERE id = ?', (paper_id,))
+            c.execute('SELECT 1 FROM papers WHERE id = %s', (paper_id,))
             if c.fetchone():
                 paper_version_map[paper_id] = paper['versions']
             else:
@@ -484,21 +482,22 @@ def save_versions(paper_versions, conn):
     
     try:
         # Batch update papers
-        for i in range(0, len(paper_updates), PAPER_UPDATE_BATCH_SIZE):
-            batch = paper_updates[i:i + PAPER_UPDATE_BATCH_SIZE]
+        for i in range(0, len(paper_updates), batch_size):
+            batch = paper_updates[i:i + batch_size]
             c.executemany('''
                 UPDATE papers 
-                SET created = ?, updated = ?, withdrawn = ?
-                WHERE id = ?
+                SET created = %s, updated = %s, withdrawn = %s
+                WHERE id = %s
             ''', batch)
         
         # Batch insert versions
-        for i in range(0, len(version_inserts), VERSION_BATCH_SIZE):
-            batch = version_inserts[i:i + VERSION_BATCH_SIZE]
+        for i in range(0, len(version_inserts), batch_size):
+            batch = version_inserts[i:i + batch_size]
             c.executemany('''
-                INSERT OR IGNORE INTO paper_versions (
+                INSERT INTO paper_versions (
                     paper_id, version, source_type, size, date
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (paper_id, version) DO NOTHING
             ''', batch)
         
         conn.commit()
@@ -648,12 +647,17 @@ def inspect_papers(conn, limit=5):
     # Get sample papers with their authors
     c.execute('''
         SELECT p.id, p.title, p.abstract, p.categories, p.created, p.updated,
-               GROUP_CONCAT(a.keyname || COALESCE(', ' || a.forenames, '') || COALESCE(' ' || a.suffix, ''))
+               STRING_AGG(
+                   a.keyname || 
+                   COALESCE(', ' || a.forenames, '') || 
+                   COALESCE(' ' || a.suffix, ''),
+                   ', '  # This is the separator BETWEEN authors
+               ) as authors
         FROM papers p
         LEFT JOIN paper_authors pa ON p.id = pa.paper_id
         LEFT JOIN authors a ON pa.author_id = a.id
         GROUP BY p.id
-        LIMIT ?
+        LIMIT %s
     ''', (limit,))
     
     papers = c.fetchall()
@@ -711,10 +715,10 @@ def inspect_papers(conn, limit=5):
     c.execute('''
         SELECT category, COUNT(*) as count
         FROM (
-            SELECT TRIM(value) as category
-            FROM papers, json_each('["' || REPLACE(categories, ' ', '","') || '"]')
+            SELECT UNNEST(string_to_array(categories, ' ')) as category
+            FROM papers
             WHERE categories IS NOT NULL
-        )
+        ) 
         WHERE category != ''
         GROUP BY category
         ORDER BY count DESC
@@ -796,7 +800,12 @@ def inspect_papers(conn, limit=5):
             p.id,
             p.title,
             p.categories,
-            GROUP_CONCAT(a.keyname || COALESCE(', ' || a.forenames, '') || COALESCE(' ' || a.suffix, '')) as authors
+            STRING_AGG(
+                a.keyname || 
+                COALESCE(', ' || a.forenames, '') || 
+                COALESCE(' ' || a.suffix, ''),
+                ', '  # This is the separator BETWEEN authors
+            ) as authors
         FROM papers p
         LEFT JOIN paper_authors pa ON p.id = pa.paper_id
         LEFT JOIN authors a ON pa.author_id = a.id
@@ -839,45 +848,14 @@ inspect_papers(conn)
 
 # %% [markdown]
 # ## 3.2 Database Backup
-# Saves the database to Google Drive for persistence.
 
 # %%
-# Mount Google Drive
-from google.colab import drive # pyright: ignore [reportMissingImports]
-drive.mount('/content/drive')
+def backup_database():
+    """Backup PostgreSQL database to Google Drive"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    print(f"Creating PostgreSQL backup at {backup_path}")
+    !pg_dump -U postgres -F c -f "{backup_path}" # pyright: ignore
+    print("Backup completed successfully")
 
-# Create project directory if it doesn't exist
-%mkdir -p "/content/drive/MyDrive/ai-safety-papers" # pyright: ignore
-
-# Copy database to Drive
-%cp papers.db "/content/drive/MyDrive/ai-safety-papers/papers.db" # pyright: ignore
-print("Database saved to Google Drive at: /ai-safety-papers/papers.db")
-
-# %% [markdown]
-# ## 3.3 Database Recovery
-# Use this section if harvesting was interrupted and you need to clean up and retry with data in memory.
-# **Important**: Only run if you have the `initial_papers` variable from a previous interrupted run.
-
-# %%
-# Drop all tables in correct order (respecting foreign key constraints)
-c = conn.cursor()
-c.execute("DROP TABLE IF EXISTS paper_versions")
-c.execute("DROP TABLE IF EXISTS paper_authors")
-c.execute("DROP TABLE IF EXISTS authors")
-c.execute("DROP TABLE IF EXISTS papers")
-conn.commit()
-
-# Recreate tables
-create_database()
-
-# Resave papers from memory
-if 'initial_papers' in locals():
-    print("Found papers in memory, saving them...")
-    save_papers(initial_papers, conn)
-    
-    # Print count of saved papers
-    c.execute('SELECT COUNT(*) FROM papers')
-    final_count = c.fetchone()[0]
-    print(f"\nPapers saved after cleanup: {final_count}")
-else:
-    print("No papers found in memory. You'll need to run the harvesting cell again.") 
+# Run backup after saving data
+backup_database()

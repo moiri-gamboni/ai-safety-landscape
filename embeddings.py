@@ -20,14 +20,21 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    # Install only the packages needed for this notebook
+    # Install and configure PostgreSQL
+    !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
+    !sudo service postgresql start # pyright: ignore
+    !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
+    !sudo service postgresql restart # pyright: ignore
+    
+    # Install Python client
+    %pip install psycopg2-binary # pyright: ignore
     %pip install voyageai tqdm scikit-learn tenacity # pyright: ignore
 
 # %% [markdown]
 # ## 2. Database Connection
 
 # %%
-import sqlite3
+import psycopg2
 import os
 import numpy as np
 from tqdm import tqdm
@@ -59,33 +66,52 @@ else:
 vo = voyageai.Client()
 
 # Path to database
-db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
-local_db = "papers.db"
+db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.db"
 
-# Copy database to local storage if needed
-print(f"Copying database to local storage: {local_db}")
-if not os.path.exists(local_db):
-    %cp "{db_path}" {local_db} # pyright: ignore
+# Load database backup before connecting
+def load_database():
+    """Load PostgreSQL backup using pg_restore"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    print("Loading PostgreSQL backup...")
+    !pg_restore -U postgres -d postgres -c -F c "{backup_path}" # pyright: ignore
 
-conn = sqlite3.connect(local_db)
-conn.row_factory = sqlite3.Row
+# Run restore at startup
+load_database()
 
-# Check if abstract_embedding and token_count columns exist
-cursor = conn.cursor()
-cursor.execute("PRAGMA table_info(papers)")
-columns = [column[1] for column in cursor.fetchall()]
+# Now connect to the restored database
+def connect_db():
+    """Connect to PostgreSQL database with schema validation"""
+    conn = psycopg2.connect(
+        host='',
+        database="postgres",
+        user="postgres"
+    )
+    
+    # Check for abstract_embedding column
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'papers' 
+                AND column_name = 'abstract_embedding'
+            )
+        ''')
+        if not cursor.fetchone()[0]:
+            print("Adding abstract_embedding column...")
+            cursor.execute('''
+                ALTER TABLE papers 
+                ADD COLUMN abstract_embedding BYTEA
+            ''')
+            cursor.execute('''
+                CREATE INDEX idx_abstract_embedding 
+                ON papers(abstract_embedding)
+            ''')
+            conn.commit()
+    
+    return conn
 
-if 'abstract_embedding' not in columns:
-    print("Adding abstract_embedding column...")
-    conn.execute('''
-        ALTER TABLE papers 
-        ADD COLUMN abstract_embedding BLOB
-    ''')
-    conn.execute('''
-        CREATE INDEX IF NOT EXISTS idx_abstract_embedding 
-        ON papers(abstract_embedding)
-    ''')
-    conn.commit()
+conn = connect_db()
 
 # %% [markdown]
 # ## 3. Embedding Generation
@@ -142,7 +168,7 @@ def embed_with_backoff(abstracts, model="voyage-3-large"):
         output_dimension=2048
     )
 
-def get_csai_papers(conn: sqlite3.Connection, batch_size: int = 128):
+def get_csai_papers(conn: psycopg2.extensions.connection, batch_size: int = 128):
     """Generator that yields batches of papers with cs.AI in their categories
     
     Args:
@@ -298,8 +324,8 @@ try:
                     embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
                     cursor.execute('''
                         UPDATE papers
-                        SET abstract_embedding = ?
-                        WHERE id = ?
+                        SET abstract_embedding = %s
+                        WHERE id = %s
                     ''', (embedding_blob, paper_id))
                 
                 conn.commit()
@@ -666,7 +692,11 @@ find_duplicates(conn)
 %cp duplicates.csv "/content/drive/MyDrive/ai-safety-papers/duplicates.csv" # pyright: ignore
 print(f"Duplicates saved to Drive")
 
-# Copy updated database back to Drive
-%cp {local_db} "{db_path}" # pyright: ignore
-print("Database backup completed to Google Drive")
+def backup_embeddings():
+    """Use pg_dump for PostgreSQL backups"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    !pg_dump -U postgres -F c -f "{backup_path}" postgres # pyright: ignore
+
+# Call backup after processing
+backup_embeddings()
 
