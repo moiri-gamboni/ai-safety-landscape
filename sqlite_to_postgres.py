@@ -21,8 +21,8 @@ import os
 if 'COLAB_GPU' in os.environ:
     %pip install psycopg2-binary tqdm postgresql-client # pyright: ignore
     # Install PostgreSQL in Colab environment
-    !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib
-    !sudo service postgresql start
+    !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
+    !sudo service postgresql start # pyright: ignore
 
 # Mount Google Drive
 from google.colab import drive # pyright: ignore [reportMissingImports]
@@ -276,7 +276,7 @@ def backup_postgres_db():
     print(f"Creating PostgreSQL backup at {backup_path}")
     
     # Create backup using pg_dump
-    !PGPASSWORD=$POSTGRES_PASSWORD pg_dump -h {postgres_host} -U {postgres_user} -d {postgres_db} -F c -f {backup_path}
+    !PGPASSWORD=$POSTGRES_PASSWORD pg_dump -h {postgres_host} -U {postgres_user} -d {postgres_db} -F c -f {backup_path} # pyright: ignore
     
     print("Backup completed successfully")
 
