@@ -47,6 +47,7 @@ from tenacity import (
     wait_random_exponential,
 )
 import re
+from psycopg2.extras import DictCursor
 
 # Load API key from Colab form or environment
 if 'COLAB_GPU' in os.environ:
@@ -188,7 +189,7 @@ def get_csai_papers(conn: psycopg2.extensions.connection, batch_size: int = 128)
         conn: Database connection
         batch_size: Maximum number of papers per batch
     """
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=DictCursor)
     
     # First get total count for progress bar
     cursor.execute('''
@@ -381,7 +382,7 @@ def validate_embeddings(conn):
     # Set fixed seeds for reproducibility
     np.random.seed(42)
     
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=DictCursor)
     
     print("\n=== Embedding Quality Checks ===")
     
@@ -634,7 +635,7 @@ def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv
         return ' '.join(title.split())
     
     # Get papers with embeddings
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=DictCursor)
     cursor.execute('''
         SELECT id, title, embedding
         FROM papers
