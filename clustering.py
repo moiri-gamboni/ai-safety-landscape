@@ -26,7 +26,13 @@ drive.mount('/content/drive')
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    %pip install optuna hdbscan umap-learn numpy cupy-cuda12x # pyright: ignore
+    # Install and configure PostgreSQL
+    !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
+    !sudo service postgresql start # pyright: ignore
+    !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
+    !sudo service postgresql restart # pyright: ignore
+    
+    %pip install psycopg2-binary optuna hdbscan umap-learn numpy cupy-cuda12x # pyright: ignore
     !git clone https://github.com/rapidsai/rapidsai-csp-utils.git # pyright: ignore
     !python rapidsai-csp-utils/colab/pip-install.py # pyright: ignore
 
@@ -58,24 +64,34 @@ from cuml.neighbors import NearestNeighbors
 
 # %%
 # Database configuration
-db_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
-local_db = "papers.db"
+db_backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
 
-# Initialize database connection
-print(f"Copying database to local storage: {local_db}")
-if not os.path.exists(local_db):
-    %cp "{db_path}" {local_db} # pyright: ignore
+def get_db_connection():
+    """Create PostgreSQL connection with retries"""
+    import psycopg2
+    from psycopg2.extras import DictCursor
+    
+    return psycopg2.connect(
+        host='',
+        database="postgres",
+        user="postgres",
+        cursor_factory=DictCursor
+    )
 
-conn = sqlite3.connect(local_db)
-conn.row_factory = sqlite3.Row
 
+# After creating connection but before creating tables:
+print("Loading existing database...")
+!psql -U postgres -d postgres -f "{db_backup_path}" # pyright: ignore
+conn = get_db_connection()
+
+# %%
 # Create tables
 cursor = conn.cursor()
 
 # UMAP tables
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS umap_runs (
-    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     n_components INTEGER,
     n_neighbors INTEGER,
@@ -86,7 +102,7 @@ cursor.execute('''
 CREATE TABLE IF NOT EXISTS umap_results (
     run_id INTEGER,
     paper_id TEXT,
-    embedding BLOB,
+    embedding BYTEA,
     PRIMARY KEY (run_id, paper_id),
     FOREIGN KEY (run_id) REFERENCES umap_runs(run_id),
     FOREIGN KEY (paper_id) REFERENCES papers(id)
@@ -95,10 +111,10 @@ CREATE TABLE IF NOT EXISTS umap_results (
 # Clustering tables
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS clustering_runs (
-    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id SERIAL PRIMARY KEY,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     umap_run_id INTEGER,
-    is_optimal BOOLEAN DEFAULT 0,
+    is_optimal BOOLEAN DEFAULT FALSE,
     min_cluster_size INTEGER,
     min_samples INTEGER,
     cluster_selection_epsilon REAL,
@@ -183,7 +199,7 @@ def check_existing_umap_run(n_components, n_neighbors, min_dist):
     cursor = conn.cursor()
     cursor.execute('''
         SELECT run_id FROM umap_runs
-        WHERE n_components = ? AND n_neighbors = ? AND min_dist = ?
+        WHERE n_components = %s AND n_neighbors = %s AND min_dist = %s
     ''', (n_components, n_neighbors, min_dist))
     result = cursor.fetchone()
     return result['run_id'] if result else None
@@ -209,20 +225,24 @@ def save_umap_run(paper_ids, embeddings, n_components, n_neighbors, min_dist):
     """Save UMAP results to database"""
     print(f"\nSaving UMAP results to database (n={len(paper_ids)})...")
     cursor = conn.cursor()
-    cursor.execute('BEGIN')
     
     try:
         cursor.execute('''
             INSERT INTO umap_runs (n_components, n_neighbors, min_dist)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
+            RETURNING run_id
         ''', (n_components, n_neighbors, min_dist))
-        run_id = cursor.lastrowid
+        run_id = cursor.fetchone()['run_id']
         
-        for pid, emb in zip(paper_ids, embeddings):
-            cursor.execute('''
-                INSERT INTO umap_results (run_id, paper_id, embedding)
-                VALUES (?, ?, ?)
-            ''', (run_id, pid, emb.astype(cp.float32).get().tobytes()))
+        # Batch insert embeddings
+        insert_data = [
+            (run_id, pid, emb.astype(cp.float32).get().tobytes())
+            for pid, emb in zip(paper_ids, embeddings)
+        ]
+        
+        args = ','.join(cursor.mogrify("(%s,%s,%s)", row).decode('utf-8') 
+                      for row in insert_data)
+        cursor.execute(f"INSERT INTO umap_results VALUES {args}")
         
         conn.commit()
         print(f"Saved UMAP run {run_id} with {len(paper_ids)} entries")
@@ -238,7 +258,7 @@ def load_umap_embeddings(run_id):
     cursor.execute('''
         SELECT paper_id, embedding 
         FROM umap_results 
-        WHERE run_id = ?
+        WHERE run_id = %s
         ORDER BY paper_id
     ''', (run_id,))
     
@@ -246,8 +266,9 @@ def load_umap_embeddings(run_id):
     if not results:
         raise ValueError(f"No embeddings found for run {run_id}")
     
-    paper_ids = [row[0] for row in results]
-    embeddings = cp.array([cp.frombuffer(row[1], dtype=cp.float32) for row in results])
+    paper_ids = [row['paper_id'] for row in results]
+    embeddings = cp.array([cp.frombuffer(row['embedding'], dtype=cp.float32) 
+                         for row in results])
     
     return embeddings, paper_ids
 
@@ -365,7 +386,7 @@ def objective(trial, embeddings, knn_graph):
     
     if existing_cluster_id:
         cursor = conn.cursor()
-        cursor.execute('SELECT dbcvi_score FROM clustering_runs WHERE run_id = ?', (existing_cluster_id,))
+        cursor.execute('SELECT dbcvi_score FROM clustering_runs WHERE run_id = %s', (existing_cluster_id,))
         score = cursor.fetchone()['dbcvi_score']
         
         # Add this critical line to propagate the existing run ID
@@ -437,10 +458,10 @@ def check_existing_clustering_run(umap_run_id, **hdbscan_params):
     cursor = conn.cursor()
     cursor.execute('''
         SELECT run_id FROM clustering_runs
-        WHERE umap_run_id = ?
-        AND min_cluster_size = ?
-        AND min_samples = ?
-        AND cluster_selection_epsilon = ?
+        WHERE umap_run_id = %s
+        AND min_cluster_size = %s
+        AND min_samples = %s
+        AND cluster_selection_epsilon = %s
     ''', (
         umap_run_id,
         hdbscan_params['min_cluster_size'],
@@ -488,7 +509,7 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
             umap_run_id, min_cluster_size, min_samples, cluster_selection_epsilon,
             trust_score, dbcvi_score, noise_ratio, n_clusters,
             mean_persistence, std_persistence, mean_cluster_size, std_cluster_size, cluster_size_ratio
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ''', (
         umap_run_id,
         hdbscan_params['min_cluster_size'],
@@ -524,7 +545,7 @@ def save_cluster_hierarchy(run_id, condensed_tree):
     # Batch insert using executemany with correct columns
     cursor.executemany('''
         INSERT INTO cluster_hierarchy
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
     ''', [
         (run_id, int(row.parent), int(row.child), 
          float(row.lambda_val), int(row.child_size))
@@ -559,11 +580,11 @@ def optimize_clustering(embeddings, knn_graph, n_trials=50):
             if new_best_id != best_run_id:
                 print(f"New best run found! Updating marker to run {new_best_id}")
                 cursor = conn.cursor()
-                cursor.execute('UPDATE clustering_runs SET is_optimal = 0')
+                cursor.execute('UPDATE clustering_runs SET is_optimal = FALSE')
                 cursor.execute('''
                     UPDATE clustering_runs 
-                    SET is_optimal = 1 
-                    WHERE run_id = ?
+                    SET is_optimal = TRUE 
+                    WHERE run_id = %s
                 ''', (new_best_id,))
                 conn.commit()
                 best_run_id = new_best_id
@@ -591,11 +612,17 @@ print("Optimization complete! Best parameters saved to database.")
 # ## 7. Database Backup
 
 # %%
-# Copy updated database back to Drive
-print("\nStarting database backup to Google Drive...")
-%cp {local_db} "{db_path}" # pyright: ignore
-print("Backup completed successfully")
+def backup_database():
+    """Backup PostgreSQL database to Google Drive"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    print(f"Creating PostgreSQL backup at {backup_path}")
+    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
+    print("Backup completed successfully")
 
+# Run backup after saving data
+backup_database()
+
+# %%
 # Unassign GPU to free up resources
 from google.colab import runtime # pyright: ignore [reportMissingImports]
 runtime.unassign()
