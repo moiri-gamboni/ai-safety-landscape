@@ -311,9 +311,9 @@ def objective(trial, scaled_embeddings, knn_graph):
             metric='cosine',
             output_type='cupy'
         )
-        reduced_embeddings = reducer.fit_transform(scaled_embeddings).astype(cp.float32).get()
+        reduced_embeddings = reducer.fit_transform(scaled_embeddings).astype(cp.float32)
     else:
-        reduced_embeddings = scaled_embeddings  # Use original embeddings
+        reduced_embeddings = scaled_embeddings  # Already cupy
 
     # HDBSCAN parameters
     clusterer = HDBSCAN(
@@ -342,9 +342,14 @@ def objective(trial, scaled_embeddings, knn_graph):
     ''', [
         (trial.number, pid, 
          emb.tobytes() if use_umap else None,
-         int(cluster), 
-         float(prob))
-        for pid, emb, cluster, prob in zip(paper_ids, reduced_embeddings, labels, clusterer.probabilities_)
+         int(cluster.item()), 
+         float(prob.item()))
+        for pid, emb, cluster, prob in zip(
+            paper_ids, 
+            reduced_embeddings,
+            labels.get(),  # Convert cupy→numpy once for entire array
+            clusterer.probabilities_.get()  # Same here
+        )
     ])
     
     # Save hierarchy tree
