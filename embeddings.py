@@ -445,7 +445,7 @@ def validate_embeddings(conn):
         FROM papers 
         WHERE embedding IS NOT NULL
           AND categories LIKE '%cs.AI%'
-          AND ABS(RANDOM() % 100) = 0  -- Fast random sampling
+          AND RANDOM() < 0.01  -- Sample ~1% of records
         LIMIT 10000
     ''')
     papers = cursor.fetchall()
