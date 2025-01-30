@@ -152,7 +152,6 @@ def load_embeddings():
     return paper_ids, scaled_embeddings, knn_graph
 
 paper_ids, embeddings, knn_graph = load_embeddings()
-gc.collect()
 
 # %% [markdown]
 # ## 4. Core Functions
@@ -260,7 +259,7 @@ def load_sampler():
             return pickle.load(f)
     return None
 
-def calculate_metrics(clusterer, labels, use_umap, original_embeddings, processed_embeddings):
+def calculate_metrics(cluster_persistences, labels, use_umap, original_embeddings, processed_embeddings):
     """Calculate all metrics while maintaining GPU arrays where possible"""
     metrics = {}
     
@@ -276,7 +275,7 @@ def calculate_metrics(clusterer, labels, use_umap, original_embeddings, processe
     if valid_labels.size > 0:
         # Use Cupy for GPU-accelerated calculations
         cluster_sizes = cp.bincount(valid_labels)
-        persistence = clusterer.cluster_persistence_
+        persistence = cluster_persistences
         
         metrics.update({
             'noise_ratio': cp.sum(~valid_mask).item() / len(labels),
@@ -340,17 +339,17 @@ def objective(trial, scaled_embeddings, knn_graph):
         gen_min_span_tree=True,
         output_type='cupy'
     )
-    labels = clusterer.fit_predict(reduced_embeddings)
-
+    
     # Extract needed components first
+    labels = clusterer.fit_predict(reduced_embeddings)
     mst = clusterer.minimum_spanning_tree_
     tree_df = clusterer.condensed_tree_.to_pandas()
+    probabilities = clusterer.probabilities_
+    cluster_persistences = clusterer.cluster_persistence_
     del clusterer  # ← Release hierarchy data
-    
-    # Use mst and tree_df instead
-    
+
     # Calculate metrics
-    metrics = calculate_metrics(clusterer, labels, use_umap, scaled_embeddings, reduced_embeddings)
+    metrics = calculate_metrics(cluster_persistences, labels, use_umap, scaled_embeddings, reduced_embeddings)
     dbcvi_score = compute_relative_validity(mst, labels)
 
     # Store metrics (excluding dbcvi_score which is the objective value)
@@ -367,7 +366,7 @@ def objective(trial, scaled_embeddings, knn_graph):
             paper_ids, 
             reduced_embeddings,
             labels.get(),  # Convert cupy→numpy once for entire array
-            clusterer.probabilities_.get()  # Same here
+            probabilities.get()  # Same here
         )
     ), BATCH_SIZE):
         cursor.executemany('''
@@ -401,23 +400,11 @@ def optimize_clustering(embeddings, knn_graph, n_trials):
         sampler=load_sampler()
     )
     
-    refresh_interval = 5  # Adjust based on memory constraints
-    trial_counter = 0
-    
     # Save sampler periodically
     study.optimize(
         lambda trial: objective(trial, embeddings, knn_graph),
-        n_trials=1,  # Process one trial at a time
-        callbacks=[
-            lambda study, trial: [
-                save_sampler(study),
-                (trial_counter := trial_counter + 1),
-                (trial_counter % refresh_interval == 0 and [
-                    conn.close(),
-                    (conn := get_db_connection())
-                ])
-            ]
-        ]
+        n_trials=n_trials,
+        callbacks=[lambda study, trial: save_sampler(study)]
     )
     
     return study
@@ -426,6 +413,7 @@ def optimize_clustering(embeddings, knn_graph, n_trials):
 # ## 6. Run Optimization
 
 # %%
+gc.collect()
 study = optimize_clustering(embeddings, knn_graph, n_trials=50)
 print("Optimization complete! Best parameters saved to database.")
 
