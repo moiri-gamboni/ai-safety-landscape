@@ -39,8 +39,7 @@ drive.mount('/content/drive')
 
 # %%
 # @title Database Credentials
-postgres_host = "localhost" # @param {type:"string"}
-postgres_db = "papers" # @param {type:"string"}
+postgres_db = "postgres" # @param {type:"string"} (using default database)
 postgres_user = "postgres" # @param {type:"string"}
 
 import sqlite3
@@ -55,9 +54,10 @@ sqlite_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
 sqlite_conn = sqlite3.connect(sqlite_path)
 sqlite_conn.row_factory = sqlite3.Row
 
-# Connect to PostgreSQL without password
+
+# Connect to default postgres database
 postgres_conn = psycopg2.connect(
-    host='',  # Empty string forces Unix socket connection
+    host='',
     database=postgres_db,
     user=postgres_user
 )
@@ -279,8 +279,8 @@ def backup_postgres_db():
     
     print(f"Creating PostgreSQL backup at {backup_path}")
     
-    # Updated dump command without password
-    !pg_dump -h localhost -U postgres -d {postgres_db} -F c -f {backup_path} # pyright: ignore
+    # Updated dump command for default database
+    !pg_dump -h localhost -U postgres -F c -f {backup_path}
     
     print("Backup completed successfully")
 
