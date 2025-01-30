@@ -390,7 +390,7 @@ def objective(trial, scaled_embeddings, knn_graph):
     gc.collect()  # Force garbage collection after each trial
     return dbcvi_score
 
-def optimize_clustering(embeddings, knn_graph, n_trials):
+def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
     """Run optimization study with Optuna integration"""
     study = optuna.create_study(
         study_name="ai-papers-clustering",
@@ -403,6 +403,7 @@ def optimize_clustering(embeddings, knn_graph, n_trials):
     # Save sampler periodically
     study.optimize(
         lambda trial: objective(trial, embeddings, knn_graph),
+        n_jobs=n_jobs,
         n_trials=n_trials,
         callbacks=[lambda study, trial: save_sampler(study)]
     )
@@ -414,7 +415,7 @@ def optimize_clustering(embeddings, knn_graph, n_trials):
 
 # %%
 gc.collect()
-study = optimize_clustering(embeddings, knn_graph, n_trials=50)
+study = optimize_clustering(embeddings, knn_graph, n_jobs=3, n_trials=50)
 print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
