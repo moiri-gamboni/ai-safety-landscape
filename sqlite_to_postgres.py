@@ -129,12 +129,7 @@ def create_postgres_schema(pg_cursor):
         pg_cursor.execute('CREATE INDEX idx_withdrawn ON papers(withdrawn)')
         pg_cursor.execute('CREATE INDEX idx_created ON papers(created)')
         pg_cursor.execute('CREATE INDEX idx_updated ON papers(updated)')
-        
-        # After table creation
-        pg_cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_abstract_embedding 
-            ON papers(abstract_embedding)
-        ''')
+        pg_cursor.execute('CREATE INDEX idx_abstract_embedding ON papers(abstract_embedding)')
         
         print("PostgreSQL schema created successfully")
         
@@ -185,7 +180,6 @@ def clean_orphaned_versions(sqlite_conn):
     sqlite_conn.commit()
     print(f"Cleaned up {deleted_count} orphaned paper_version records")
 
-check_orphaned_versions(sqlite_conn)
 clean_orphaned_versions(sqlite_conn)
 
 # %% [markdown]
