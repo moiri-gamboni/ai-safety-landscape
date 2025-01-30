@@ -170,7 +170,7 @@ def load_embeddings():
     nn_model.fit(scaled_embeddings)
     knn_graph = nn_model.kneighbors_graph(scaled_embeddings, mode='distance')
     
-    print(f"Precomputed {knn_graph.shape[1]} neighbors for each sample")
+    print(f"Done precomputing graph")
     return paper_ids, scaled_embeddings, knn_graph
 
 paper_ids, embeddings, knn_graph = load_embeddings()
@@ -193,10 +193,6 @@ def perform_umap_reduction(embeddings, n_components, n_neighbors, min_dist, knn_
     """UMAP using precomputed k-NN graph"""
     print(f"\nPerforming {n_components}D UMAP reduction with parameters:")
     print(f"n_neighbors: {n_neighbors}, min_dist: {min_dist}")
-    
-    # Validate neighbor count
-    if n_neighbors > knn_graph.shape[1]:
-        raise ValueError(f"Requested {n_neighbors} neighbors exceeds precomputed {knn_graph.shape[1]}")
     
     reducer = UMAP(
         n_components=n_components,
@@ -329,8 +325,7 @@ def objective(trial, embeddings, knn_graph):
         umap_params = {
             'n_components': trial.suggest_int('n_components', 15, 100),
             'n_neighbors': trial.suggest_int('n_neighbors', 30, 100),
-            'min_dist': 0.0,
-            'knn_graph': knn_graph
+            'min_dist': 0.0
         }
         
         # Check for existing UMAP run
@@ -339,9 +334,15 @@ def objective(trial, embeddings, knn_graph):
         if existing_umap_id:
             reduced_embeddings, _ = load_umap_embeddings(existing_umap_id)
         else:
-            # Perform and save new UMAP reduction
-            reduced_embeddings = perform_umap_reduction(embeddings, **umap_params)
+            # Pass knn_graph separately to perform_umap_reduction
+            reduced_embeddings = perform_umap_reduction(
+                embeddings, 
+                knn_graph=knn_graph,
+                **umap_params
+            )
             existing_umap_id = save_umap_run(paper_ids, reduced_embeddings, **umap_params)
+    else:
+        print("Using standardized embeddings without UMAP")
 
     # HDBSCAN parameters
     min_cluster_size = trial.suggest_int('min_cluster_size', 20, 100)
@@ -411,13 +412,13 @@ def objective(trial, embeddings, knn_graph):
     
     # Only create visualization embedding if we used UMAP
     if use_umap:
-        create_visualization_embedding(umap_params, existing_umap_id)
+        create_visualization_embedding(umap_params, knn_graph)
     
     trial.set_user_attr('db_run_id', run_id)  # Store actual DB ID
     return dbcvi_score
 
-def create_visualization_embedding(umap_params, main_run_id):
-    """Ensure 2D visualization embedding exists"""
+def create_visualization_embedding(umap_params, knn_graph):
+    """Ensure 2D visualization embedding exists using precomputed k-NN"""
     if umap_params['n_components'] == 2:
         return
     
@@ -429,7 +430,7 @@ def create_visualization_embedding(umap_params, main_run_id):
         print(f"Using existing 2D visualization embedding (run {viz_run_id})")
     else:
         print("\nCreating new 2D visualization embedding...")
-        viz_embeddings = perform_umap_reduction(embeddings, **viz_params)
+        viz_embeddings = perform_umap_reduction(embeddings, knn_graph=knn_graph, **viz_params)
         viz_run_id = save_umap_run(paper_ids, viz_embeddings, **viz_params)
         print(f"Created 2D visualization embedding (run {viz_run_id})")
 
