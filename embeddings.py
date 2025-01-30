@@ -72,7 +72,7 @@ def load_database():
     """Load PostgreSQL backup using psql"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     print("Loading PostgreSQL backup...")
-    !psql -U postgres -d postgres -f "{backup_path}"
+    !psql -U postgres -d postgres -f "{backup_path}" # pyright: ignore
 
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
