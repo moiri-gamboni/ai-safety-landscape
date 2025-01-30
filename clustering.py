@@ -352,6 +352,14 @@ def objective(trial, scaled_embeddings, knn_graph):
     metrics = calculate_metrics(cluster_persistences, labels, use_umap, scaled_embeddings, reduced_embeddings)
     dbcvi_score = compute_relative_validity(mst, labels)
 
+    # Print metrics in readable format
+    print(f"\nTrial {trial.number} results:")
+    print(f"  • Noise ratio: {metrics['noise_ratio']:.1%}")
+    print(f"  • Clusters: {metrics['n_clusters']}")
+    print(f"  • Avg cluster size: {metrics['mean_cluster_size']:.1f} ± {metrics['std_cluster_size']:.1f}")
+    print(f"  • Trust score: {metrics['trust_score']:.3f}" if metrics['trust_score'] else "  • Trust score: N/A")
+    print(f"  • DBCVI score: {dbcvi_score:.3f}")
+
     # Store metrics (excluding dbcvi_score which is the objective value)
     for k, v in metrics.items():
         trial.set_user_attr(k, v)
