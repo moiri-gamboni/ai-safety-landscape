@@ -12,3 +12,4 @@ scikit-learn
 cuml-cu12==24.12.*
 permetrics
 optuna
+psycopg2-binary

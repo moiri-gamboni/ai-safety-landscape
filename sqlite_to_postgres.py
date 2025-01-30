@@ -19,10 +19,10 @@
 # Install required packages if running in Colab
 import os
 if 'COLAB_GPU' in os.environ:
-    %pip install psycopg2-binary tqdm postgresql-client # pyright: ignore
     # Install PostgreSQL in Colab environment
     !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
     !sudo service postgresql start # pyright: ignore
+    %pip install psycopg2-binary tqdm # pyright: ignore
 
 # Mount Google Drive
 from google.colab import drive # pyright: ignore [reportMissingImports]
