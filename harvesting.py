@@ -445,7 +445,12 @@ def save_versions(paper_versions, conn):
     for paper in paper_versions:
         paper_id = paper['id']
         if 'versions' in paper:
-            paper_version_map[paper_id] = paper['versions']
+            # Only keep versions for papers that exist
+            c.execute('SELECT 1 FROM papers WHERE id = ?', (paper_id,))
+            if c.fetchone():
+                paper_version_map[paper_id] = paper['versions']
+            else:
+                print(f"Warning: Skipping versions for non-existent paper {paper_id}")
     
     # Collect all data first
     for paper_id, versions in paper_version_map.items():

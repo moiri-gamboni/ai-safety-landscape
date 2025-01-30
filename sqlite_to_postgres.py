@@ -148,6 +148,47 @@ create_postgres_schema(pg_cursor)
 postgres_conn.commit()
 
 # %% [markdown]
+# ## 3.1 Data Integrity Check
+
+# %%
+def check_orphaned_versions(sqlite_conn):
+    """Check for paper_versions without corresponding papers"""
+    cur = sqlite_conn.cursor()
+    cur.execute('''
+        SELECT COUNT(*) 
+        FROM paper_versions 
+        WHERE paper_id NOT IN (SELECT id FROM papers)
+    ''')
+    orphan_count = cur.fetchone()[0]
+    
+    print(f"Found {orphan_count} orphaned paper_version records")
+    
+    if orphan_count > 0:
+        print("\nSample orphaned records:")
+        cur.execute('''
+            SELECT paper_id, version 
+            FROM paper_versions 
+            WHERE paper_id NOT IN (SELECT id FROM papers)
+            LIMIT 5
+        ''')
+        for row in cur.fetchall():
+            print(f"Paper ID: {row[0]}, Version: {row[1]}")
+
+def clean_orphaned_versions(sqlite_conn):
+    """Remove orphaned paper_version records"""
+    cur = sqlite_conn.cursor()
+    cur.execute('''
+        DELETE FROM paper_versions
+        WHERE paper_id NOT IN (SELECT id FROM papers)
+    ''')
+    deleted_count = cur.rowcount
+    sqlite_conn.commit()
+    print(f"Cleaned up {deleted_count} orphaned paper_version records")
+
+check_orphaned_versions(sqlite_conn)
+clean_orphaned_versions(sqlite_conn)
+
+# %% [markdown]
 # ## 4. Data Migration
 
 # %%
@@ -286,7 +327,7 @@ def backup_postgres_db():
     print(f"Creating PostgreSQL backup at {backup_path}")
     
     # Updated dump command for default database
-    !pg_dump -h localhost -U postgres -F c -f {backup_path}
+    !pg_dump -h localhost -U postgres -F c -f {backup_path} # pyright: ignore
     
     print("Backup completed successfully")
 
