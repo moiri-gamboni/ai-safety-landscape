@@ -5,9 +5,9 @@
 # ---
 
 # %% [markdown]
-# # AI Safety Papers - Abstract Embedding Phase
+# # AI Safety Papers - Embedding Phase
 # 
-# This notebook generates Voyage AI embeddings for paper abstracts and stores them in the database.
+# This notebook generates Voyage AI embeddings for paper titles and abstracts and stores them in the database.
 
 # %% [markdown]
 # ## 1. Environment Setup
@@ -68,17 +68,12 @@ vo = voyageai.Client()
 # Path to database
 db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.db"
 
-# Load database backup before connecting
 def load_database():
     """Load PostgreSQL backup using pg_restore"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     print("Loading PostgreSQL backup...")
     !pg_restore -U postgres -d postgres -c -F c "{backup_path}" # pyright: ignore
 
-# Run restore at startup
-load_database()
-
-# Now connect to the restored database
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
     conn = psycopg2.connect(
@@ -86,32 +81,51 @@ def connect_db():
         database="postgres",
         user="postgres"
     )
-    
-    # Check for abstract_embedding column
+    return conn
+
+load_database()
+conn = connect_db()
+
+# %% [markdown]
+# ### Column Reset (Run when reprocessing)
+# %%
+def drop_embedding_column():
+    """Drop the embedding column for reprocessing"""
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            ALTER TABLE papers 
+            DROP COLUMN IF EXISTS abstract_embedding
+        ''')
+        conn.commit()
+    print("Dropped abstract_embedding column")
+
+drop_embedding_column()
+
+# %%
+def create_columns():
+    # Check for embedding column
     with conn.cursor() as cursor:
         cursor.execute('''
             SELECT EXISTS (
                 SELECT 1 
                 FROM information_schema.columns 
                 WHERE table_name = 'papers' 
-                AND column_name = 'abstract_embedding'
+                AND column_name = 'embedding'
             )
         ''')
         if not cursor.fetchone()[0]:
-            print("Adding abstract_embedding column...")
+            print("Adding embedding column...")
             cursor.execute('''
                 ALTER TABLE papers 
-                ADD COLUMN abstract_embedding BYTEA
+                ADD COLUMN embedding BYTEA
             ''')
             cursor.execute('''
-                CREATE INDEX idx_abstract_embedding 
-                ON papers(abstract_embedding)
+                CREATE INDEX idx_embedding_not_null 
+                ON papers ((embedding IS NOT NULL)) 
             ''')
             conn.commit()
-    
-    return conn
 
-conn = connect_db()
+create_columns()
 
 # %% [markdown]
 # ## 3. Embedding Generation
@@ -160,9 +174,9 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 @retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
-def embed_with_backoff(abstracts, model="voyage-3-large"):
+def embed_with_backoff(texts, model="voyage-3-large"):
     return vo.embed(
-        abstracts,
+        texts,
         model=model,
         input_type="document",
         output_dimension=2048
@@ -180,11 +194,12 @@ def get_csai_papers(conn: psycopg2.extensions.connection, batch_size: int = 128)
     # First get total count for progress bar
     cursor.execute('''
         WITH split_categories AS (
-            SELECT id, abstract
+            SELECT id, title, abstract
             FROM papers
             WHERE categories LIKE '%cs.AI%'
+              AND title IS NOT NULL
               AND abstract IS NOT NULL
-              AND abstract_embedding IS NULL
+              AND embedding IS NULL
         )
         SELECT COUNT(*) FROM split_categories
     ''')
@@ -193,19 +208,20 @@ def get_csai_papers(conn: psycopg2.extensions.connection, batch_size: int = 128)
     # Then fetch papers in batches
     cursor.execute('''
         WITH split_categories AS (
-            SELECT id, abstract
+            SELECT id, title, abstract
             FROM papers
             WHERE categories LIKE '%cs.AI%'
+              AND title IS NOT NULL
               AND abstract IS NOT NULL
-              AND abstract_embedding IS NULL
+              AND embedding IS NULL
         )
-        SELECT id, abstract FROM split_categories
+        SELECT id, title, abstract FROM split_categories
     ''')
     
     batch = []
     with tqdm(total=total_papers, desc="Processing papers", unit=" papers") as pbar:
         for row in cursor:
-            batch.append((row['id'], row['abstract']))
+            batch.append((row['id'], f"{row['title']}\n{row['abstract']}"))
             if len(batch) >= batch_size:
                 pbar.update(len(batch))
                 yield batch
@@ -218,7 +234,7 @@ def adjust_batch_for_token_limit(batch: List[Tuple[str, str]], model: str = "voy
     """Split a batch into sub-batches that respect the token limit
     
     Args:
-        batch: List of (id, abstract) tuples
+        batch: List of (id, text) tuples
         model: Voyage AI model to use
     
     Returns:
@@ -226,27 +242,27 @@ def adjust_batch_for_token_limit(batch: List[Tuple[str, str]], model: str = "voy
     """
     TOKEN_LIMIT = 120_000  # voyage-3-large limit
     
-    abstracts = [item[1] for item in batch]
-    token_counts = [vo.count_tokens([abstract], model=model) for abstract in abstracts]
+    texts = [item[1] for item in batch]
+    token_counts = [vo.count_tokens([text], model=model) for text in texts]
     
     sub_batches = []
     current_batch = []
     current_tokens = 0
     
-    for (paper_id, abstract), token_count in zip(batch, token_counts):
-        # If single abstract exceeds limit, skip it
+    for (paper_id, text), token_count in zip(batch, token_counts):
+        # If single text exceeds limit, skip it
         if token_count > TOKEN_LIMIT:
-            print(f"Warning: Abstract {paper_id} exceeds token limit ({token_count} tokens), skipping")
+            print(f"Warning: Text {paper_id} exceeds token limit ({token_count} tokens), skipping")
             continue
             
-        # If adding this abstract would exceed limit, start new batch
+        # If adding this text would exceed limit, start new batch
         if current_tokens + token_count > TOKEN_LIMIT:
             if current_batch:
                 sub_batches.append(current_batch)
-            current_batch = [(paper_id, abstract)]
+            current_batch = [(paper_id, text)]
             current_tokens = token_count
         else:
-            current_batch.append((paper_id, abstract))
+            current_batch.append((paper_id, text))
             current_tokens += token_count
     
     if current_batch:
@@ -256,12 +272,12 @@ def adjust_batch_for_token_limit(batch: List[Tuple[str, str]], model: str = "voy
 
 def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -> List[Tuple[str, List[float]]]:
     """Process a batch of papers, returning embeddings"""
-    abstracts = [item[1] for item in batch]
+    texts = [item[1] for item in batch]
     paper_ids = [item[0] for item in batch]
     
     # First count tokens for rate limiting
     try:
-        token_count = vo.count_tokens(abstracts, model=model)
+        token_count = vo.count_tokens(texts, model=model)
     except Exception as e:
         print(f"Error counting tokens: {str(e)}")
         raise
@@ -272,7 +288,7 @@ def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -
     
     # Generate embeddings with exponential backoff
     try:
-        result = embed_with_backoff(abstracts, model=model)
+        result = embed_with_backoff(texts, model=model)
         
         if isinstance(result, float):
             raise ValueError(f"API returned float instead of EmbeddingsObject: {result}")
@@ -292,7 +308,7 @@ def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -
         print(f"Exception args: {e.args}")
         print(f"Full exception: {repr(e)}")
         print("\nInput that caused error:")
-        print(f"First abstract: {abstracts[0][:500]}...")  # Truncate long abstracts
+        print(f"First text: {texts[0][:500]}...")  # Truncate long texts
         raise
 
 # Process in batches
@@ -324,7 +340,7 @@ try:
                     embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
                     cursor.execute('''
                         UPDATE papers
-                        SET abstract_embedding = %s
+                        SET embedding = %s
                         WHERE id = %s
                     ''', (embedding_blob, paper_id))
                 
@@ -375,10 +391,11 @@ def validate_embeddings(conn):
     cursor.execute('''
         SELECT 
             COUNT(*) AS total_csai,
-            SUM(CASE WHEN abstract_embedding IS NOT NULL THEN 1 ELSE 0 END) AS with_embedding,
-            SUM(CASE WHEN abstract_embedding IS NULL THEN 1 ELSE 0 END) AS without_embedding
+            SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) AS with_embedding,
+            SUM(CASE WHEN embedding IS NULL THEN 1 ELSE 0 END) AS without_embedding
         FROM papers 
         WHERE categories LIKE '%cs.AI%'
+          AND title IS NOT NULL
           AND abstract IS NOT NULL
     ''')
     stats = cursor.fetchone()
@@ -389,14 +406,14 @@ def validate_embeddings(conn):
 
     # 2. Validity Check (NaN/Zero vectors)
     cursor.execute('''
-        SELECT abstract_embedding 
+        SELECT embedding 
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
     ''')
     invalid_count = 0
     total_checked = 0
     for row in cursor:
-        embedding = np.frombuffer(row['abstract_embedding'], dtype=np.float32)
+        embedding = np.frombuffer(row['embedding'], dtype=np.float32)
         if np.isnan(embedding).any():
             invalid_count += 1
         elif np.all(embedding == 0):
@@ -408,13 +425,13 @@ def validate_embeddings(conn):
 
     # 3. Norm Analysis
     cursor.execute('''
-        SELECT abstract_embedding 
+        SELECT embedding 
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
     ''')
     norms = []
     for row in cursor:
-        embedding = np.frombuffer(row['abstract_embedding'], dtype=np.float32)
+        embedding = np.frombuffer(row['embedding'], dtype=np.float32)
         norms.append(np.linalg.norm(embedding))
     
     print(f"\n3. Norm Analysis (sample):")
@@ -425,15 +442,15 @@ def validate_embeddings(conn):
     # 4. Similarity Analysis
     # Get random pairs more efficiently
     cursor.execute('''
-        SELECT id, title, abstract, abstract_embedding 
+        SELECT id, title, abstract, embedding 
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
           AND categories LIKE '%cs.AI%'
           AND ABS(RANDOM() % 100) = 0  -- Fast random sampling
         LIMIT 10000
     ''')
     papers = cursor.fetchall()
-    random_embeddings = np.vstack([np.frombuffer(row['abstract_embedding'], dtype=np.float32) for row in papers])
+    random_embeddings = np.vstack([np.frombuffer(row['embedding'], dtype=np.float32) for row in papers])
     
     # Analyze embedding components
     print("\n4. Embedding Analysis:")
@@ -565,13 +582,13 @@ def validate_embeddings(conn):
     
     # Get sample of embeddings
     cursor.execute('''
-        SELECT id, title, abstract, abstract_embedding
+        SELECT id, title, abstract, embedding
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
         LIMIT 1000
     ''')
     papers = cursor.fetchall()
-    embeddings = [np.frombuffer(row['abstract_embedding'], dtype=np.float32) for row in papers]
+    embeddings = [np.frombuffer(row['embedding'], dtype=np.float32) for row in papers]
     all_embeddings = np.array(embeddings)
     
     # Basic embedding stats
@@ -621,9 +638,9 @@ def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv
     # Get papers with embeddings
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, title, abstract_embedding
+        SELECT id, title, embedding
         FROM papers
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
           AND withdrawn = 0
     ''')
     
@@ -644,7 +661,7 @@ def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv
     for title, group in title_groups.items():
         if len(group) > 1:  # Only process groups with multiple papers
             # Compare embeddings within group
-            embeddings = np.vstack([np.frombuffer(p['abstract_embedding'], dtype=np.float32) for p in group])
+            embeddings = np.vstack([np.frombuffer(p['embedding'], dtype=np.float32) for p in group])
             similarities = cosine_similarity(embeddings)
             
             # Find pairs above threshold (excluding self-similarity)

@@ -84,7 +84,7 @@ def create_postgres_schema(pg_cursor):
                 updated TIMESTAMP,
                 withdrawn BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                abstract_embedding BYTEA
+                embedding BYTEA
             )
         ''')
         
@@ -129,8 +129,8 @@ def create_postgres_schema(pg_cursor):
         
         # Create partial index for existence checks
         pg_cursor.execute('''
-            CREATE INDEX idx_abstract_embedding_not_null 
-            ON papers ((abstract_embedding IS NOT NULL))
+            CREATE INDEX idx_embedding_not_null 
+            ON papers ((embedding IS NOT NULL))
         ''')
         
         print("PostgreSQL schema created successfully")
@@ -214,7 +214,7 @@ def migrate_table(sqlite_conn, pg_cursor, table_name, columns, batch_size=1000):
                     if col == 'withdrawn' and value is not None:
                         value = bool(value)
                     # Handle numpy arrays for embeddings
-                    if col == 'abstract_embedding' and value is not None:
+                    if col == 'embedding' and value is not None:
                         value = psycopg2.Binary(value)
                     row_data.append(value)
                 rows.append(tuple(row_data))
@@ -239,7 +239,7 @@ def migrate_table(sqlite_conn, pg_cursor, table_name, columns, batch_size=1000):
 tables = [
     ('papers', ['id', 'title', 'abstract', 'categories', 'msc_class', 'acm_class',
                 'doi', 'license', 'comments', 'created', 'updated', 'withdrawn',
-                'created_at', 'abstract_embedding']),
+                'created_at', 'embedding']),
     ('authors', ['id', 'keyname', 'forenames', 'suffix']),
     ('paper_versions', ['paper_id', 'version', 'source_type', 'size', 'date']),
     ('paper_authors', ['paper_id', 'author_id', 'author_position'])
@@ -308,9 +308,9 @@ def validate_migration(sqlite_conn, postgres_conn):
 
     # Add this to your validation
     pg_cur.execute('''
-        SELECT id, LENGTH(abstract_embedding) as embed_size
+        SELECT id, LENGTH(embedding) as embed_size
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
         LIMIT 5
     ''')
     print("\nPostgreSQL embedding sizes:")
@@ -319,9 +319,9 @@ def validate_migration(sqlite_conn, postgres_conn):
 
     # Compare with SQLite
     sqlite_cur.execute('''
-        SELECT id, LENGTH(abstract_embedding) as embed_size
+        SELECT id, LENGTH(embedding) as embed_size
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL
+        WHERE embedding IS NOT NULL
         LIMIT 5
     ''')
     print("\nSQLite embedding sizes:")
