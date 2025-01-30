@@ -129,7 +129,12 @@ def create_postgres_schema(pg_cursor):
         pg_cursor.execute('CREATE INDEX idx_withdrawn ON papers(withdrawn)')
         pg_cursor.execute('CREATE INDEX idx_created ON papers(created)')
         pg_cursor.execute('CREATE INDEX idx_updated ON papers(updated)')
-        pg_cursor.execute('CREATE INDEX idx_abstract_embedding ON papers(abstract_embedding)')
+        
+        # Create partial index for existence checks
+        pg_cursor.execute('''
+            CREATE INDEX idx_abstract_embedding_not_null 
+            ON papers ((abstract_embedding IS NOT NULL))
+        ''')
         
         print("PostgreSQL schema created successfully")
         
