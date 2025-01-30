@@ -321,12 +321,12 @@ validate_migration(sqlite_conn, postgres_conn)
 # %%
 def backup_postgres_db():
     """Backup PostgreSQL database to Google Drive"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/postgres_backup.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     
     print(f"Creating PostgreSQL backup at {backup_path}")
     
-    # Updated dump command for default database
-    !pg_dump -h localhost -U postgres -F c -f {backup_path} # pyright: ignore
+    # Remove -h localhost to use peer authentication instead of password
+    !pg_dump -U postgres -F c -f {backup_path} # pyright: ignore
     
     print("Backup completed successfully")
 
