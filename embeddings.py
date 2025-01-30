@@ -39,7 +39,6 @@ import os
 import numpy as np
 from tqdm import tqdm
 import voyageai
-from sklearn.metrics.pairwise import cosine_similarity
 import time
 from typing import List, Tuple, Optional
 from tenacity import (
@@ -376,7 +375,6 @@ finally:
 
 # %%
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 def validate_embeddings(conn):
     """Run quality checks on generated embeddings"""
@@ -531,7 +529,7 @@ def validate_embeddings(conn):
             n_examples: Number of outlier examples to show
         """
         # Calculate pairwise similarities
-        similarities = cosine_similarity(embeddings)
+        similarities = np.dot(embeddings, embeddings.T)  # embeddings already normalized
         
         # For each paper, get average similarity to other papers
         # Exclude self-similarity (1.0) from the average
@@ -662,7 +660,8 @@ def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv
         if len(group) > 1:  # Only process groups with multiple papers
             # Compare embeddings within group
             embeddings = np.vstack([np.frombuffer(p['embedding'], dtype=np.float32) for p in group])
-            similarities = cosine_similarity(embeddings)
+            # Use dot product directly since embeddings are already normalized
+            similarities = np.dot(embeddings, embeddings.T)  # No normalization needed
             
             # Find pairs above threshold (excluding self-similarity)
             for i in range(len(similarities)):
