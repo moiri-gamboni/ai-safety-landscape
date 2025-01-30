@@ -596,4 +596,7 @@ print("\nStarting database backup to Google Drive...")
 %cp {local_db} "{db_path}" # pyright: ignore
 print("Backup completed successfully")
 
+# Unassign GPU to free up resources
+from google.colab import runtime # pyright: ignore [reportMissingImports]
+runtime.unassign()
 
