@@ -640,7 +640,7 @@ def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv
         SELECT id, title, embedding
         FROM papers
         WHERE embedding IS NOT NULL
-          AND withdrawn = 0
+          AND withdrawn = false
     ''')
     
     # Group by normalized title
