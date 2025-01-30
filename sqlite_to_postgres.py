@@ -22,6 +22,12 @@ if 'COLAB_GPU' in os.environ:
     # Install PostgreSQL in Colab environment
     !sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
     !sudo service postgresql start # pyright: ignore
+    
+    # Configure PostgreSQL to allow passwordless access
+    !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
+    !sudo service postgresql restart # pyright: ignore
+    
+    # Install Python client
     %pip install psycopg2-binary tqdm # pyright: ignore
 
 # Mount Google Drive
@@ -34,9 +40,8 @@ drive.mount('/content/drive')
 # %%
 # @title Database Credentials
 postgres_host = "localhost" # @param {type:"string"}
-postgres_db = "arxiv_papers" # @param {type:"string"}
+postgres_db = "papers" # @param {type:"string"}
 postgres_user = "postgres" # @param {type:"string"}
-postgres_password = "" # @param {type:"string"}
 
 import sqlite3
 import psycopg2
@@ -50,12 +55,11 @@ sqlite_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
 sqlite_conn = sqlite3.connect(sqlite_path)
 sqlite_conn.row_factory = sqlite3.Row
 
-# Connect to PostgreSQL
+# Connect to PostgreSQL without password
 postgres_conn = psycopg2.connect(
-    host=postgres_host,
+    host='',  # Empty string forces Unix socket connection
     database=postgres_db,
-    user=postgres_user,
-    password=postgres_password
+    user=postgres_user
 )
 postgres_conn.autocommit = False
 pg_cursor = postgres_conn.cursor()
@@ -275,8 +279,8 @@ def backup_postgres_db():
     
     print(f"Creating PostgreSQL backup at {backup_path}")
     
-    # Create backup using pg_dump
-    !PGPASSWORD=$POSTGRES_PASSWORD pg_dump -h {postgres_host} -U {postgres_user} -d {postgres_db} -F c -f {backup_path} # pyright: ignore
+    # Updated dump command without password
+    !pg_dump -h localhost -U postgres -d {postgres_db} -F c -f {backup_path} # pyright: ignore
     
     print("Backup completed successfully")
 
