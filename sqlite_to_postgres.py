@@ -130,6 +130,12 @@ def create_postgres_schema(pg_cursor):
         pg_cursor.execute('CREATE INDEX idx_created ON papers(created)')
         pg_cursor.execute('CREATE INDEX idx_updated ON papers(updated)')
         
+        # After table creation
+        pg_cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_abstract_embedding 
+            ON papers(abstract_embedding)
+        ''')
+        
         print("PostgreSQL schema created successfully")
         
     except psycopg2.Error as e:
