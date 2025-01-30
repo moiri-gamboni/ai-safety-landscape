@@ -51,6 +51,7 @@ cuml.set_global_output_type('cupy')
 
 # Optimization imports
 import optuna
+from optuna.trial import TrialState
 
 # Locale fix after install https://github.com/googlecolab/colabtools/issues/3409
 import locale
@@ -398,6 +399,19 @@ def objective(trial, scaled_embeddings, knn_graph):
     gc.collect()  # Force garbage collection after each trial
     return dbcvi_score
 
+def backup_database():
+    """Backup PostgreSQL database to Google Drive"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    print(f"Creating PostgreSQL backup at {backup_path}")
+    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
+    print("Backup completed successfully")
+
+# Combined backup callback that saves both sampler and database
+def backup(study, _):
+    if len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))) % 10 == 0:
+        save_sampler(study)  # Save sampler state first
+        backup_database()     # Then backup database
+
 def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
     """Run optimization study with Optuna integration"""
     study = optuna.create_study(
@@ -408,12 +422,11 @@ def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
         sampler=load_sampler()
     )
     
-    # Save sampler periodically
     study.optimize(
         lambda trial: objective(trial, embeddings, knn_graph),
         n_jobs=n_jobs,
         n_trials=n_trials,
-        callbacks=[lambda study, trial: save_sampler(study)]
+        callbacks=[backup]
     )
     
     return study
@@ -423,22 +436,11 @@ def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
 
 # %%
 gc.collect()
-study = optimize_clustering(embeddings, knn_graph, n_jobs=3, n_trials=50)
+study = optimize_clustering(embeddings, knn_graph, n_jobs=10, n_trials=500)
 print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
 # ## 7. Database Backup
-
-# %%
-def backup_database():
-    """Backup PostgreSQL database to Google Drive"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
-    print(f"Creating PostgreSQL backup at {backup_path}")
-    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
-    print("Backup completed successfully")
-
-# Run backup after saving data
-backup_database()
 
 # %%
 # Unassign GPU to free up resources
