@@ -61,6 +61,8 @@ from cuml.neighbors import NearestNeighbors
 
 # Additional imports
 import pickle
+from itertools import islice
+import gc
 
 # %% [markdown]
 # ## 2. Database Setup
@@ -119,14 +121,14 @@ conn.commit()
 # %%
 def load_embeddings():
     """Load embeddings and precompute k-NN graph"""
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, embedding 
-        FROM papers 
-        WHERE embedding IS NOT NULL AND withdrawn = FALSE
-    ''')
-    print(f"Loading embeddings")
-    results = cursor.fetchall()
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT id, embedding 
+            FROM papers 
+            WHERE embedding IS NOT NULL AND withdrawn = FALSE
+        ''')
+        print(f"Loading embeddings")
+        results = cursor.fetchall()
     if not results:
         raise ValueError("No embeddings found in database")
     
@@ -138,6 +140,7 @@ def load_embeddings():
     raw_embeddings = cp.array([cp.frombuffer(row[1], dtype=cp.float32) for row in results])
     scaler = StandardScaler()
     scaled_embeddings = scaler.fit_transform(raw_embeddings)
+    del raw_embeddings, results  # Free original data
     
     # Precompute k-NN graph with max neighbors needed
     print("Precomputing k-NN graph for UMAP...")
@@ -149,6 +152,7 @@ def load_embeddings():
     return paper_ids, scaled_embeddings, knn_graph
 
 paper_ids, embeddings, knn_graph = load_embeddings()
+gc.collect()
 
 # %% [markdown]
 # ## 4. Core Functions
@@ -231,7 +235,11 @@ def compute_relative_validity(minimum_spanning_tree, labels):
     # Compute final score
     V_index = (DSPC_wrt - DSC) / np.maximum(DSPC_wrt, DSC)
     weighted_V = (cluster_sizes * V_index) / total
-    return float(np.sum(weighted_V))
+    result = float(np.sum(weighted_V))
+    
+    # Explicit cleanup
+    del labels, mst_df
+    return result
 
 def get_optuna_storage():
     return "postgresql://postgres@/postgres"  # Omit host entirely for Unix socket
@@ -292,6 +300,13 @@ def calculate_metrics(clusterer, labels, use_umap, original_embeddings, processe
     
     return metrics
 
+BATCH_SIZE = 1000
+
+def batched(iterable, n):
+    iterator = iter(iterable)
+    while batch := list(islice(iterator, n)):
+        yield batch
+
 def objective(trial, scaled_embeddings, knn_graph):
     """Optuna optimization objective function"""
     # UMAP configuration
@@ -312,6 +327,7 @@ def objective(trial, scaled_embeddings, knn_graph):
             output_type='cupy'
         )
         reduced_embeddings = reducer.fit_transform(scaled_embeddings).astype(cp.float32)
+        del reducer
     else:
         reduced_embeddings = scaled_embeddings  # Already cupy
 
@@ -325,20 +341,24 @@ def objective(trial, scaled_embeddings, knn_graph):
         output_type='cupy'
     )
     labels = clusterer.fit_predict(reduced_embeddings)
+
+    # Extract needed components first
+    mst = clusterer.minimum_spanning_tree_
+    tree_df = clusterer.condensed_tree_.to_pandas()
+    del clusterer  # ← Release hierarchy data
+    
+    # Use mst and tree_df instead
     
     # Calculate metrics
     metrics = calculate_metrics(clusterer, labels, use_umap, scaled_embeddings, reduced_embeddings)
-    dbcvi_score = compute_relative_validity(clusterer.minimum_spanning_tree_, labels)
+    dbcvi_score = compute_relative_validity(mst, labels)
 
     # Store metrics (excluding dbcvi_score which is the objective value)
     for k, v in metrics.items():
         trial.set_user_attr(k, v)
     
     # Save combined artifacts
-    cursor.executemany('''
-        INSERT INTO artifacts
-        VALUES (%s, %s, %s, %s, %s)
-    ''', [
+    for batch in batched((
         (trial.number, pid, 
          emb.tobytes() if use_umap else None,
          int(cluster.item()), 
@@ -349,10 +369,14 @@ def objective(trial, scaled_embeddings, knn_graph):
             labels.get(),  # Convert cupy→numpy once for entire array
             clusterer.probabilities_.get()  # Same here
         )
-    ])
+    ), BATCH_SIZE):
+        cursor.executemany('''
+            INSERT INTO artifacts
+            VALUES (%s, %s, %s, %s, %s)
+        ''', batch)
+        conn.commit()
     
     # Save hierarchy tree
-    tree_df = clusterer.condensed_tree_.to_pandas()
     meaningful_edges = tree_df[tree_df.child_size > 1]
     cursor.executemany('''
         INSERT INTO cluster_trees
@@ -364,6 +388,7 @@ def objective(trial, scaled_embeddings, knn_graph):
     ])
     
     conn.commit()
+    gc.collect()  # Force garbage collection after each trial
     return dbcvi_score
 
 def optimize_clustering(embeddings, knn_graph, n_trials):
@@ -376,11 +401,23 @@ def optimize_clustering(embeddings, knn_graph, n_trials):
         sampler=load_sampler()
     )
     
+    refresh_interval = 5  # Adjust based on memory constraints
+    trial_counter = 0
+    
     # Save sampler periodically
     study.optimize(
         lambda trial: objective(trial, embeddings, knn_graph),
-        n_trials=n_trials,
-        callbacks=[lambda study, trial: save_sampler(study)]
+        n_trials=1,  # Process one trial at a time
+        callbacks=[
+            lambda study, trial: [
+                save_sampler(study),
+                (trial_counter := trial_counter + 1),
+                (trial_counter % refresh_interval == 0 and [
+                    conn.close(),
+                    (conn := get_db_connection())
+                ])
+            ]
+        ]
     )
     
     return study
