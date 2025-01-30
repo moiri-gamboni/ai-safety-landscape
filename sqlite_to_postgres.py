@@ -39,9 +39,6 @@ drive.mount('/content/drive')
 
 # %%
 # @title Database Credentials
-postgres_db = "postgres" # @param {type:"string"} (using default database)
-postgres_user = "postgres" # @param {type:"string"}
-
 import sqlite3
 import psycopg2
 from tqdm import tqdm
@@ -58,8 +55,8 @@ sqlite_conn.row_factory = sqlite3.Row
 # Connect to default postgres database
 postgres_conn = psycopg2.connect(
     host='',
-    database=postgres_db,
-    user=postgres_user
+    database="postgres",
+    user="postgres"
 )
 postgres_conn.autocommit = False
 pg_cursor = postgres_conn.cursor()
