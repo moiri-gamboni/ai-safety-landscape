@@ -53,7 +53,8 @@ import psycopg2
 def load_existing_database():
     """Load existing PostgreSQL database from backup"""
     print("Loading PostgreSQL backup...")
-    !pg_restore -h localhost -U postgres -d {postgres_db} -c -F c "{backup_path}"  # pyright: ignore
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    !psql -U postgres -d postgres -f "{backup_path}"  # pyright: ignore
     return psycopg2.connect(
         host='',
         database="postgres",
@@ -62,7 +63,7 @@ def load_existing_database():
 
 def create_new_database():
     """Create a new empty database with schema"""
-    if os.path.exists('papers.db'):
+    if os.path.exists('papers_postgres.sql'):
         print("Warning: Overwriting existing local database")
     
     print("Creating new database...")
@@ -854,7 +855,7 @@ def backup_database():
     """Backup PostgreSQL database to Google Drive"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     print(f"Creating PostgreSQL backup at {backup_path}")
-    !pg_dump -U postgres -F c -f "{backup_path}" # pyright: ignore
+    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
     print("Backup completed successfully")
 
 # Run backup after saving data

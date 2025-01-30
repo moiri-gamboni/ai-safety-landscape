@@ -68,10 +68,10 @@ vo = voyageai.Client()
 db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
 
 def load_database():
-    """Load PostgreSQL backup using pg_restore"""
+    """Load PostgreSQL backup using psql"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     print("Loading PostgreSQL backup...")
-    !pg_restore -U postgres -d postgres -c -F c "{backup_path}" # pyright: ignore
+    !psql -U postgres -d postgres -f "{backup_path}"
 
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
@@ -711,7 +711,7 @@ print(f"Duplicates saved to Drive")
 def backup_embeddings():
     """Use pg_dump for PostgreSQL backups"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
-    !pg_dump -U postgres -F c -f "{backup_path}" postgres # pyright: ignore
+    !pg_dump -U postgres -F p -f "{backup_path}" postgres # pyright: ignore
 
 # Call backup after processing
 backup_embeddings()

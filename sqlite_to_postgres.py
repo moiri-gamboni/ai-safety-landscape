@@ -345,7 +345,7 @@ def backup_postgres_db():
     print(f"Creating PostgreSQL backup at {backup_path}")
     
     # Remove -h localhost to use peer authentication instead of password
-    !pg_dump -U postgres -F c -f {backup_path} # pyright: ignore
+    !pg_dump -U postgres -F p -f {backup_path} postgres # pyright: ignore
     
     print("Backup completed successfully")
 
