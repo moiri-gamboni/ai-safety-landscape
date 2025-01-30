@@ -309,6 +309,28 @@ def validate_migration(sqlite_conn, postgres_conn):
     for row in sqlite_cur.fetchall():
         print(f"ID: {row[0]}, Authors: {row[2]}")
 
+    # Add this to your validation
+    pg_cur.execute('''
+        SELECT id, LENGTH(abstract_embedding) as embed_size
+        FROM papers 
+        WHERE abstract_embedding IS NOT NULL
+        LIMIT 5
+    ''')
+    print("\nPostgreSQL embedding sizes:")
+    for row in pg_cur.fetchall():
+        print(f"{row[0]}: {row[1]} bytes")
+
+    # Compare with SQLite
+    sqlite_cur.execute('''
+        SELECT id, LENGTH(abstract_embedding) as embed_size
+        FROM papers 
+        WHERE abstract_embedding IS NOT NULL
+        LIMIT 5
+    ''')
+    print("\nSQLite embedding sizes:")
+    for row in sqlite_cur.fetchall():
+        print(f"{row[0]}: {row[1]} bytes")
+
 validate_migration(sqlite_conn, postgres_conn)
 
 # %% [markdown]
