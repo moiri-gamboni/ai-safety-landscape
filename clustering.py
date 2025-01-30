@@ -101,7 +101,6 @@ CREATE TABLE IF NOT EXISTS clustering_runs (
     is_optimal BOOLEAN DEFAULT 0,
     min_cluster_size INTEGER,
     min_samples INTEGER,
-    cluster_selection_method TEXT,
     cluster_selection_epsilon REAL,
     trust_score REAL,
     dbcvi_score REAL,
@@ -349,7 +348,6 @@ def objective(trial, embeddings, knn_graph):
     hdbscan_params = {
         'min_cluster_size': min_cluster_size,
         'min_samples': trial.suggest_int('min_samples', 5, min_cluster_size//2),
-        'cluster_selection_method': trial.suggest_categorical('cluster_selection_method', ['eom', 'leaf']),
         'cluster_selection_epsilon': trial.suggest_float('cluster_selection_epsilon', 0.0, 0.5)
     }
     
@@ -357,7 +355,6 @@ def objective(trial, embeddings, knn_graph):
     print("\nUsing HDBSCAN parameters:")
     print(f"min_cluster_size: {hdbscan_params['min_cluster_size']}")
     print(f"min_samples: {hdbscan_params['min_samples']}")
-    print(f"cluster_selection_method: {hdbscan_params['cluster_selection_method']}")
     print(f"cluster_selection_epsilon: {hdbscan_params['cluster_selection_epsilon']}")
     
     # Check for existing clustering run
@@ -378,6 +375,7 @@ def objective(trial, embeddings, knn_graph):
     # Perform clustering
     clusterer = HDBSCAN(
         **hdbscan_params,
+        cluster_selection_method='leaf',
         metric='euclidean',
         prediction_data=True,
         gen_min_span_tree=True,
@@ -442,13 +440,11 @@ def check_existing_clustering_run(umap_run_id, **hdbscan_params):
         WHERE umap_run_id = ?
         AND min_cluster_size = ?
         AND min_samples = ?
-        AND cluster_selection_method = ?
         AND cluster_selection_epsilon = ?
     ''', (
         umap_run_id,
         hdbscan_params['min_cluster_size'],
         hdbscan_params['min_samples'],
-        hdbscan_params['cluster_selection_method'],
         hdbscan_params['cluster_selection_epsilon']
     ))
     result = cursor.fetchone()
@@ -489,15 +485,14 @@ def save_optimized_run(umap_run_id, hdbscan_params, clusterer, trust_score, dbcv
     
     cursor.execute('''
         INSERT INTO clustering_runs (
-            umap_run_id, min_cluster_size, min_samples, cluster_selection_method, cluster_selection_epsilon,
+            umap_run_id, min_cluster_size, min_samples, cluster_selection_epsilon,
             trust_score, dbcvi_score, noise_ratio, n_clusters,
             mean_persistence, std_persistence, mean_cluster_size, std_cluster_size, cluster_size_ratio
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         umap_run_id,
         hdbscan_params['min_cluster_size'],
         hdbscan_params['min_samples'],
-        hdbscan_params['cluster_selection_method'],
         hdbscan_params['cluster_selection_epsilon'],
         trust_score,
         dbcvi_score,
