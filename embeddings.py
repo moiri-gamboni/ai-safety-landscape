@@ -65,7 +65,7 @@ else:
 vo = voyageai.Client()
 
 # Path to database
-db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.db"
+db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
 
 def load_database():
     """Load PostgreSQL backup using pg_restore"""
