@@ -75,7 +75,7 @@ def get_db_connection():
     from psycopg2.extras import DictCursor
     
     return psycopg2.connect(
-        host='localhost',
+        host='',  # Empty string for Unix socket connection
         database="postgres",
         user="postgres",
         cursor_factory=DictCursor
@@ -121,11 +121,11 @@ def load_embeddings():
     """Load embeddings and precompute k-NN graph"""
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, abstract_embedding 
+        SELECT id, embedding 
         FROM papers 
-        WHERE abstract_embedding IS NOT NULL AND withdrawn = 0
+        WHERE embedding IS NOT NULL AND withdrawn = FALSE
     ''')
-    
+    print(f"Loading embeddings")
     results = cursor.fetchall()
     if not results:
         raise ValueError("No embeddings found in database")
@@ -133,6 +133,7 @@ def load_embeddings():
     # Initialize arrays
     paper_ids = [row[0] for row in results]
     
+    print(f"Scaling embeddings")
     # Pure cupy buffer conversion
     raw_embeddings = cp.array([cp.frombuffer(row[1], dtype=cp.float32) for row in results])
     scaler = StandardScaler()
@@ -233,7 +234,7 @@ def compute_relative_validity(minimum_spanning_tree, labels):
     return float(np.sum(weighted_V))
 
 def get_optuna_storage():
-    return "postgresql://postgres@localhost/postgres"
+    return "postgresql://postgres@/postgres"  # Omit host entirely for Unix socket
 
 def save_sampler(study):
     """Save sampler state to Google Drive"""
@@ -241,7 +242,6 @@ def save_sampler(study):
     sampler_path = f"{drive_path}/sampler.pkl"
     with open(sampler_path, "wb") as f:
         pickle.dump(study.sampler, f)
-    print(f"Saved sampler to {sampler_path}")
 
 def load_sampler():
     """Load sampler from Google Drive if exists"""
@@ -321,7 +321,6 @@ def objective(trial, scaled_embeddings, knn_graph):
         min_samples=trial.suggest_int('min_samples', 5, 50),
         cluster_selection_epsilon=trial.suggest_float('cluster_selection_epsilon', 0.0, 0.5),
         cluster_selection_method='leaf',
-        metric='cosine',
         gen_min_span_tree=True,
         output_type='cupy'
     )
