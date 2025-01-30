@@ -396,7 +396,6 @@ def objective(trial, scaled_embeddings, knn_graph):
     ])
     
     conn.commit()
-    gc.collect()  # Force garbage collection after each trial
     return dbcvi_score
 
 def backup_database():
@@ -411,6 +410,8 @@ def backup(study, _):
     if len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))) % 10 == 0:
         save_sampler(study)  # Save sampler state first
         backup_database()     # Then backup database
+        gc.collect()  # Force garbage collection
+
 
 def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
     """Run optimization study with Optuna integration"""
