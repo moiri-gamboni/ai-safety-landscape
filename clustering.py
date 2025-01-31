@@ -32,7 +32,7 @@ if 'COLAB_GPU' in os.environ:
     !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
     !sudo service postgresql restart # pyright: ignore
     
-    %pip install psycopg2-binary optuna hdbscan umap-learn numpy cupy-cuda12x # pyright: ignore
+    %pip install joblib psycopg2-binary optuna hdbscan umap-learn numpy cupy-cuda12x # pyright: ignore
     !git clone https://github.com/rapidsai/rapidsai-csp-utils.git # pyright: ignore
     !python rapidsai-csp-utils/colab/pip-install.py # pyright: ignore
 
@@ -64,6 +64,7 @@ from cuml.neighbors import NearestNeighbors
 import pickle
 from itertools import islice
 import gc
+from joblib import parallel_backend
 
 # %% [markdown]
 # ## 2. Database Setup
@@ -410,8 +411,6 @@ def backup(study, _):
     if len(study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))) % 10 == 0:
         save_sampler(study)  # Save sampler state first
         backup_database()     # Then backup database
-        gc.collect()  # Force garbage collection
-
 
 def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
     """Run optimization study with Optuna integration"""
@@ -423,12 +422,19 @@ def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
         sampler=load_sampler()
     )
     
-    study.optimize(
-        lambda trial: objective(trial, embeddings, knn_graph),
-        n_jobs=n_jobs,
-        n_trials=n_trials,
-        callbacks=[backup]
-    )
+    with parallel_backend('multiprocessing'):
+        study.optimize(
+            lambda trial: objective(trial, embeddings, knn_graph),
+            n_jobs=n_jobs,
+            callbacks=[
+                backup,
+                optuna.study.MaxTrialsCallback(
+                    n_trials, 
+                    states=(TrialState.COMPLETE,)
+                )
+            ],
+            gc_after_trial=True
+        )
     
     return study
 
@@ -437,7 +443,7 @@ def optimize_clustering(embeddings, knn_graph, n_jobs, n_trials):
 
 # %%
 gc.collect()
-study = optimize_clustering(embeddings, knn_graph, n_jobs=10, n_trials=500)
+study = optimize_clustering(embeddings, knn_graph, n_jobs=8, n_trials=500)
 print("Optimization complete! Best parameters saved to database.")
 
 # %% [markdown]
