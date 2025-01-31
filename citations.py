@@ -7,7 +7,7 @@
 # %% [markdown]
 # # AI Safety Papers - Citation Tracking
 # 
-# This notebook fetches citation counts from OpenCitations for CS.AI papers in the database.
+# This notebook fetches citation counts from OpenCitations for embedded papers in the database.
 
 # %% [markdown]
 # ## 1. Setup
@@ -110,7 +110,7 @@ async def fetch_all_citations():
         with conn.cursor() as cursor:
             cursor.execute('''
                 SELECT id FROM papers 
-                WHERE categories LIKE '%cs.AI%'
+                WHERE embedding IS NOT NULL
                   AND withdrawn = FALSE
                   AND citation_count IS NULL
             ''')
@@ -186,7 +186,7 @@ def validate_citations():
                 COUNT(*) FILTER (WHERE citation_count IS NOT NULL) AS processed,
                 COUNT(*) FILTER (WHERE citation_count IS NULL) AS unprocessed
             FROM papers 
-            WHERE categories LIKE '%cs.AI%'
+            WHERE embedding IS NOT NULL
               AND withdrawn = FALSE
         ''')
         processed, unprocessed = cursor.fetchone()
@@ -204,7 +204,7 @@ def validate_citations():
                     MIN(citation_count) AS min,
                     MAX(citation_count) AS max
                 FROM papers 
-                WHERE categories LIKE '%cs.AI%'
+                WHERE embedding IS NOT NULL
                   AND withdrawn = FALSE
                   AND citation_count IS NOT NULL
             ''')
