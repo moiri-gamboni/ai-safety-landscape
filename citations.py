@@ -209,9 +209,22 @@ def validate_citations():
                   AND citation_count IS NOT NULL
             ''')
             stats = cursor.fetchone()
+            
+            # Papers with citations
+            cursor.execute('''
+                SELECT COUNT(*) 
+                FROM papers 
+                WHERE citation_count > 0 
+                  AND embedding IS NOT NULL
+                  AND withdrawn = FALSE
+                  AND citation_count IS NOT NULL
+            ''')
+            non_zero = cursor.fetchone()[0]
+
             print(f"\nCitation Statistics for {processed} processed papers:")
             print(f"• Average: {stats[0]:.1f} ± {stats[1]:.1f}")
             print(f"• Range: {stats[2]} - {stats[3]}")
+            print(f"• Papers with citations: {non_zero} ({non_zero/processed:.1%})")
 
 validate_citations()
 
