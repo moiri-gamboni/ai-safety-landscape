@@ -340,8 +340,11 @@ def perform_2d_umap():
         # Convert to numpy array instead of cupy
         embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
         
-        # Use CPU-based UMAP implementation
-        reducer = UMAP(n_components=2, random_state=42)
+        # Use CPU-based UMAP implementation with trial parameters
+        reducer = UMAP(
+            n_components=2,  # Fixed for visualization
+            n_neighbors=best_trial_data['params']['n_neighbors'],
+        )
         viz_embeddings = reducer.fit_transform(embeddings)
         
         # Store results
