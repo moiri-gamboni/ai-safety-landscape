@@ -151,7 +151,14 @@ def verify_database():
         c.execute("SELECT COUNT(*) FROM paper_versions")
         versions = c.fetchone()[0]
         print(f"\nVersion History: {versions} total versions")
-        c.execute("SELECT AVG(version_count) FROM (SELECT paper_id, COUNT(*) as version_count FROM paper_versions GROUP BY paper_id)")
+        c.execute("""
+            SELECT AVG(version_count) 
+            FROM (
+                SELECT paper_id, COUNT(*) as version_count 
+                FROM paper_versions 
+                GROUP BY paper_id
+            ) AS versions_subquery
+        """)
         avg_versions = c.fetchone()[0]
         print(f"Average versions per paper: {avg_versions:.1f}")
 
@@ -193,6 +200,21 @@ def verify_database():
         print(f"\nCluster Metrics (Trial {BEST_TRIAL}):")
         print(f"- Total clusters: {clusters}")
         print(f"- Average cluster probability: {avg_prob:.2f} ± {std_prob:.2f}")
+
+        # Citation distribution analysis
+        c.execute("""
+            SELECT 
+                COUNT(*) FILTER (WHERE citation_count > 0) AS non_zero,
+                COUNT(*) FILTER (WHERE citation_count = 0) AS zero,
+                COUNT(*) FILTER (WHERE citation_count IS NULL) AS nulls
+            FROM papers
+        """)
+        non_zero, zero, nulls = c.fetchone()
+
+        print(f"\nCitation Distribution:")
+        print(f"- Papers with citations: {non_zero} ({non_zero/total_papers:.1%})")
+        print(f"- Zero-citation papers: {zero} ({zero/total_papers:.1%})")
+        print(f"- Unknown citation status: {nulls} ({nulls/total_papers:.1%})")
 
 verify_database()
 
