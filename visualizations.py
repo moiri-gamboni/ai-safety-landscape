@@ -12,9 +12,11 @@
 # 2. Cluster metrics and statistics
 # 3. Hierarchical structure exploration
 # 4. Cluster content analysis
-#
-# ## Setup
 
+# %% [markdown]
+# ## 1. Setup
+
+#%%
 # Mount Google Drive
 from google.colab import drive # pyright: ignore [reportMissingImports]
 drive.mount('/content/drive')
