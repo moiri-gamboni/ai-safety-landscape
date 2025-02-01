@@ -32,7 +32,7 @@ if 'COLAB_GPU' in os.environ:
     
     # Install Python client
     %pip install psycopg2-binary umap-learn # pyright: ignore
-    %pip install matplotlib seaborn scipy scikit-learn networkx umap-learn # pyright: ignore
+    %pip install matplotlib seaborn scipy scikit-learn networkx umap-learn hdbscan # pyright: ignore
 
 
 # %% [markdown]
@@ -211,6 +211,102 @@ def analyze_cluster_at_level(cluster_id, lambda_val):
         'children': children,
         'papers': papers
     }
+
+def calculate_validity_metrics():
+    """Calculate HDBSCAN validity metrics for the best trial"""
+    import hdbscan
+    
+    # Get all cluster assignments and embeddings
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, p.embedding 
+        FROM artifacts a
+        JOIN papers p ON a.paper_id = p.id
+        WHERE a.trial_id = %s AND a.cluster_id != -1
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Convert to numpy arrays
+    labels = np.array([r[0] for r in results])
+    embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
+    
+    # Calculate validity metrics
+    validity = hdbscan.validity.validity_index(
+        X=embeddings,
+        labels=labels,
+        metric='euclidean',
+        d=embeddings.shape[1],
+        per_cluster_scores=True
+    )
+    
+    # Get density separation between clusters
+    unique_labels = np.unique(labels)
+    density_separations = []
+    for i in range(len(unique_labels)):
+        for j in range(i+1, len(unique_labels)):
+            sep = hdbscan.validity.density_separation(
+                X=embeddings,
+                labels=labels,
+                cluster_id1=unique_labels[i],
+                cluster_id2=unique_labels[j],
+                internal_nodes1=None,
+                internal_nodes2=None,
+                core_distances1=None,
+                core_distances2=None
+            )
+            density_separations.append(sep)
+    
+    # Store per-cluster metrics in database
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cluster_metrics (
+                trial_id INTEGER NOT NULL,
+                cluster_id INTEGER NOT NULL,
+                validity_index REAL,
+                density_separation REAL,
+                PRIMARY KEY (trial_id, cluster_id)
+            )
+        ''')
+        for cluster_id, validity_score in validity[1].items():
+            cursor.execute('''
+                INSERT INTO cluster_metrics 
+                (trial_id, cluster_id, validity_index)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (trial_id, cluster_id) DO UPDATE SET
+                    validity_index = EXCLUDED.validity_index
+            ''', (best_trial, cluster_id, validity_score))
+        conn.commit()
+    
+    return {
+        'overall_validity': validity[0],
+        'mean_density_separation': np.mean(density_separations),
+        'min_density_separation': np.min(density_separations)
+    }
+
+def calculate_and_store_validity_metrics():
+    """Calculate and store validity metrics if missing"""
+    if 'validity_index' not in best_trial_data['metrics']:
+        # Calculate metrics
+        validity_metrics = calculate_validity_metrics()
+        
+        # Update JSON data
+        best_trial_data['metrics'].update({
+            'validity_index': validity_metrics['overall_validity'],
+            'mean_density_sep': validity_metrics['mean_density_separation'],
+            'min_density_sep': validity_metrics['min_density_separation']
+        })
+        
+        # Save to drive
+        drive_path = "/content/drive/MyDrive/ai-safety-papers/best_trial.json"
+        with open(drive_path, 'w') as f:
+            json.dump(best_trial_data, f)
+        
+        # Print results
+        print(f"Validity Index: {validity_metrics['overall_validity']:.3f}")
+        print(f"Mean Density Separation: {validity_metrics['mean_density_separation']:.3f}")
+        print(f"Min Density Separation: {validity_metrics['min_density_separation']:.3f}")
+    else:
+        print("Validity metrics already calculated")
 
 def perform_2d_umap():
     """Generate and store 2D UMAP embeddings"""
@@ -696,6 +792,10 @@ def print_cluster_hierarchy(max_depth=None):
 # %%
 # Ensure 2D embeddings exist
 perform_2d_umap()
+
+# Calculate and store validity metrics
+calculate_and_store_validity_metrics()
+
 # Basic cluster visualization
 plot_clusters()
 
