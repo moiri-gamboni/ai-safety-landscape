@@ -16,13 +16,13 @@
 
 # %%
 # Mount Google Drive
-from google.colab import drive
+from google.colab import drive # pyright: ignore
 drive.mount('/content/drive')
 
 # Install required packages
-!sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib
-!sudo service postgresql start
-%pip install psycopg2-binary optuna
+!sudo apt-get -qq update && sudo apt-get -qq install postgresql postgresql-contrib # pyright: ignore
+!sudo service postgresql start # pyright: ignore
+%pip install psycopg2-binary optuna # pyright: ignore
 
 # %% [markdown]
 # ## 2. Identify Best Trial
@@ -73,7 +73,7 @@ print(f"Best trial: {best_trial.number} with score {best_trial.value:.3f}")
 # %%
 # Database configuration
 SOURCE_DB = "postgres"
-DEST_DB = "ai-landscape"
+DEST_DB = "papers"
 BEST_TRIAL = best_trial.number
 
 def execute_psql(command):
@@ -97,46 +97,28 @@ execute_psql(f"CREATE DATABASE {DEST_DB}")
 
 # %%
 # Export papers with embeddings (which implies cs.AI from embeddings.py)
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t papers \
-  --where "embedding IS NOT NULL" \
-  -f /tmp/papers.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/papers.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM papers WHERE embedding IS NOT NULL AND withdrawn = FALSE) TO '/tmp/papers.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy papers FROM '/tmp/papers.sql'" # pyright: ignore
 
 # Export related authors (now based on embedding presence)
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t authors \
-  --where "id IN (SELECT author_id FROM paper_authors WHERE paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL))" \
-  -f /tmp/authors.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/authors.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM authors WHERE id IN (SELECT author_id FROM paper_authors WHERE paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL AND withdrawn = FALSE))) TO '/tmp/authors.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy authors FROM '/tmp/authors.sql'" # pyright: ignore
 
 # Export paper-author relationships
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t paper_authors \
-  --where "paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL)" \
-  -f /tmp/paper_authors.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/paper_authors.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM paper_authors WHERE paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL AND withdrawn = FALSE)) TO '/tmp/paper_authors.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy paper_authors FROM '/tmp/paper_authors.sql'" # pyright: ignore
 
 # Export paper versions
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t paper_versions \
-  --where "paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL)" \
-  -f /tmp/versions.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/versions.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM paper_versions WHERE paper_id IN (SELECT id FROM papers WHERE embedding IS NOT NULL AND withdrawn = FALSE)) TO '/tmp/versions.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy paper_versions FROM '/tmp/versions.sql'" # pyright: ignore
 
 # Export best trial artifacts
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t artifacts \
-  --where "trial_id = {BEST_TRIAL}" \
-  -f /tmp/artifacts.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/artifacts.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM artifacts WHERE trial_id = {BEST_TRIAL}) TO '/tmp/artifacts.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy artifacts FROM '/tmp/artifacts.sql'" # pyright: ignore
 
 # Export cluster tree for best trial
-!pg_dump -U postgres -d {SOURCE_DB} --data-only \
-  -t cluster_trees \
-  --where "trial_id = {BEST_TRIAL}" \
-  -f /tmp/cluster_trees.sql # pyright: ignore
-!psql -U postgres -d {DEST_DB} -f /tmp/cluster_trees.sql # pyright: ignore
+!psql -U postgres -d {SOURCE_DB} -c "\copy (SELECT * FROM cluster_trees WHERE trial_id = {BEST_TRIAL}) TO '/tmp/cluster_trees.sql'" # pyright: ignore
+!psql -U postgres -d {DEST_DB} -c "\copy cluster_trees FROM '/tmp/cluster_trees.sql'" # pyright: ignore
 
 # %% [markdown]
 # ## 4. Verify Database
@@ -218,5 +200,5 @@ verify_database()
 # ## 5. Create Final Backup
 
 # %%
-!pg_dump -U postgres -d {DEST_DB} -F c -f /content/drive/MyDrive/ai-safety-papers/ai_safety_filtered.pgdump # pyright: ignore
+!pg_dump -U postgres -d {DEST_DB} -F c -f /content/drive/MyDrive/ai-safety-papers/filtered.db # pyright: ignore
 print("Filtered database backup created successfully") 
