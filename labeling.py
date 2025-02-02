@@ -45,11 +45,15 @@ def get_valid_categories():
 
 def cleanup_database():
     """Permanently remove non-target papers and analysis tables"""
+    # Remove analysis tables
     with conn.cursor() as cursor:
         print("Removing old tables...")
         cursor.execute('DROP TABLE IF EXISTS alembic_version, artifacts, cluster_trees, studies, study_directions, study_system_attributes, study_user_attributes, trial_heartbeats, trial_intermediate_values, trial_params, trial_system_attributes, trial_user_attributes, trial_values, trials, version_info CASCADE')
         cursor.execute('DROP INDEX IF EXISTS idx_categories, idx_embedding_not_null, idx_updated, ix_studies_study_name, ix_trials_study_id')
+    conn.commit()
 
+    # Schema modifications
+    with conn.cursor() as cursor:        
         print("Optimizing category filtering...")
         cursor.execute(f'''
             ALTER TABLE papers 
@@ -58,53 +62,83 @@ def cleanup_database():
                 string_to_array(categories, ' ')
             ) STORED
         ''')
-        
+    conn.commit()
+
+    with conn.cursor() as cursor:        
         print("Creating GIN index...")
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_paper_categories_arr 
             ON papers USING GIN(arxiv_categories)
         ''')
-                
+    conn.commit()
+
+    with conn.cursor() as cursor:        
+        print("Creating title index...")
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_title 
+            ON papers USING GIN(to_tsvector('english', title))
+        ''')
+    conn.commit()
+
+    # Delete related records
+    with conn.cursor() as cursor:
         print("Deleting paper_versions records...")
         cursor.execute(f'''
             DELETE FROM paper_versions
             WHERE paper_id IN (
                 SELECT id 
                 FROM papers 
-                WHERE NOT arxiv_categories && {get_valid_categories()}
+                WHERE (NOT arxiv_categories && {get_valid_categories()})
+                   OR withdrawn = TRUE
             )
         ''')
-        
+    conn.commit()
+
+    with conn.cursor() as cursor:
         print("Deleting paper_authors records...")
         cursor.execute(f'''
             DELETE FROM paper_authors
             WHERE paper_id IN (
                 SELECT id FROM papers 
-                WHERE NOT arxiv_categories && {get_valid_categories()}
+                WHERE (NOT arxiv_categories && {get_valid_categories()})
+                   OR withdrawn = TRUE
             )
         ''')
-        
+    conn.commit()
+
+    with conn.cursor() as cursor:
         print("Deleting non-target papers...")
         cursor.execute(f'''
             DELETE FROM papers
-            WHERE NOT arxiv_categories && {get_valid_categories()}
+            WHERE (NOT arxiv_categories && {get_valid_categories()})
+               OR withdrawn = TRUE
         ''')
+    conn.commit()
 
+    with conn.cursor() as cursor:
         print("Dropping original categories column...")
         cursor.execute('''
             ALTER TABLE papers 
             DROP COLUMN IF EXISTS categories
         ''')
-        
+    conn.commit()
+
+    with conn.cursor() as cursor:
         print("Deleting orphaned authors...")
         cursor.execute('''
-            DELETE FROM authors a
-            USING authors
-            LEFT JOIN paper_authors pa ON a.id = pa.author_id
-            WHERE pa.author_id IS NULL
+            DELETE FROM authors
+            WHERE id NOT IN (
+                SELECT DISTINCT author_id 
+                FROM paper_authors
+            )
         ''')
-        
-        conn.commit()
+    conn.commit()
+
+    with conn.cursor() as cursor:
+        print("Vacuuming database...")
+        cursor.execute('VACUUM FULL ANALYZE')
+    
+    print("Cleanup complete")
 
 def load_database():
     """Load and filter PostgreSQL backup"""
