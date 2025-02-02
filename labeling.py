@@ -18,7 +18,7 @@ if 'COLAB_GPU' in os.environ:
     !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
     !sudo service postgresql restart # pyright: ignore
     
-    %pip install psycopg2-binary tqdm tenacity numpy pandas # pyright: ignore
+    %pip install psycopg2-binary tqdm tenacity google-genai # pyright: ignore
 
 # %% [markdown]
 # ## 2. Load Database
@@ -51,18 +51,19 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from psycopg2.extras import DictCursor
 from typing import List, TypedDict
 import time
+from google.genai import types
 
 # Configure Gemini API
 if 'COLAB_GPU' in os.environ:
     # @title Gemini API Key
     gemini_api_key = "" # @param {type:"string"}
-    genai.configure(api_key=gemini_api_key)
+    client = genai.Client(api_key=gemini_api_key)
 else:
     from dotenv import load_dotenv
     load_dotenv()
-    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+    client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
-model = genai.GenerativeModel("models/gemini-2.0-flash-exp")
+MODEL_ID = "gemini-2.0-flash-exp"
 
 # %%
 VALID_CATEGORIES = [
@@ -267,10 +268,18 @@ Papers to analyze:
         prompt += f"\n\nTitle: {paper['title']}\nAbstract: {paper['abstract']}"
     
     # Count tokens
-    input_tokens = model.count_tokens(prompt).total_tokens
+    count_response = client.models.count_tokens(
+        model=MODEL_ID,
+        contents=prompt
+    )
+    input_tokens = count_response.total_tokens
     
     # Check rate limits (using actual output tokens)
-    response = model.generate_content(prompt, generation_config=generation_config)
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+        generation_config=generation_config
+    )
     
     if not response.usage_metadata:
         raise ValueError("Missing usage metadata in response")
