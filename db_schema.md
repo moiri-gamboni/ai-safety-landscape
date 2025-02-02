@@ -70,6 +70,9 @@ CREATE TABLE paper_authors (
 );
 ```
 
+**Indexes**:
+- `idx_author_particles` (author_id) INCLUDE (paper_id) - Covering index for fast author-based queries
+
 ## Analysis Tables (Added in clustering.py)
 
 ### 5. artifacts (Clustering Results)
