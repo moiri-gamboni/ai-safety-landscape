@@ -9,7 +9,10 @@ CREATE TABLE papers (
     id TEXT PRIMARY KEY, -- arXiv paper ID (e.g. "1706.03762")
     title TEXT, -- Paper title
     abstract TEXT, -- Full abstract text
-    categories TEXT, -- Space-separated list of categories (e.g. "cs.AI cs.LG")
+    arxiv_categories TEXT[] NOT NULL, -- Array of arXiv categories (e.g. {'cs.AI','cs.LG'})
+    llm_category TEXT, -- AI-generated category (from labeling.py)
+    safety_relevance FLOAT, -- 0-1 relevance score to AI safety
+    label_confidence FLOAT, -- 0-1 confidence in labeling
     msc_class TEXT, -- Mathematics Subject Classification
     acm_class TEXT, -- ACM classification
     doi TEXT, -- Digital Object Identifier
@@ -25,11 +28,8 @@ CREATE TABLE papers (
 ```
 
 **Indexes:**
-- `idx_categories` (categories)
-- `idx_withdrawn` (withdrawn)
+- `idx_arxiv_categories` GIN(arxiv_categories) - Array index for fast lookups
 - `idx_created` (created)
-- `idx_updated` (updated)
-- `idx_embedding_not_null` (embedding IS NOT NULL)
 
 ### 2. paper_versions (Version History)
 
