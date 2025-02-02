@@ -37,15 +37,15 @@ def get_db_connection():
     """Create PostgreSQL connection"""
     return psycopg2.connect(
         host='',
-        database="postgres",
+        database="papers",
         user="postgres"
     )
 
 def load_database():
     """Load PostgreSQL backup using psql"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print("Loading PostgreSQL backup...")
-    !psql -U postgres -d postgres -f "{backup_path}" # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -f "{backup_path}" # pyright: ignore
 
 load_database()
 conn = get_db_connection()
@@ -234,8 +234,8 @@ validate_citations()
 # %%
 def backup_citations():
     """Use pg_dump for PostgreSQL backups"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
-    !pg_dump -U postgres -F p -f "{backup_path}" postgres # pyright: ignore
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
+    !pg_dump -U postgres -F c -f "{backup_path}" papers # pyright: ignore
 
 # Call backup after processing
 backup_citations()

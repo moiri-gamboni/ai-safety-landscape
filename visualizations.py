@@ -46,13 +46,12 @@ from psycopg2.extras import DictCursor
 import json
 
 # Path to database
-db_path = "/content/drive/MyDrive/ai-safety-papers/filtered.db"
+db_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
 
 def load_database():
     """Load PostgreSQL backup using psql"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/filtered.db"
     print("Loading PostgreSQL backup...")
-    !psql -U postgres -d papers -f "{backup_path}" # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -f "{db_path}" # pyright: ignore
 
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
@@ -363,9 +362,9 @@ def perform_2d_umap():
 
 def backup_database():
     """Create compressed database backup"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/filtered_compressed.db"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print(f"Creating compressed backup at {backup_path}")
-    !pg_dump -U postgres -F c papers -f "{backup_path}"  # pyright: ignore
+    !pg_dump -U postgres -F c -f "{backup_path}" papers # pyright: ignore
     print("Backup completed successfully")
 
 # %% [markdown]

@@ -53,17 +53,17 @@ import psycopg2
 def load_existing_database():
     """Load existing PostgreSQL database from backup"""
     print("Loading PostgreSQL backup...")
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
-    !psql -U postgres -d postgres -f "{backup_path}"  # pyright: ignore
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
+    !pg_restore -U postgres --progress --jobs=4 -f "{backup_path}"  # pyright: ignore
     return psycopg2.connect(
         host='',
-        database="postgres",
+        database="papers",
         user="postgres"
     )
 
 def create_new_database():
     """Create a new empty database with schema"""
-    if os.path.exists('papers_postgres.sql'):
+    if os.path.exists('papers.sql'):
         print("Warning: Overwriting existing local database")
     
     print("Creating new database...")
@@ -92,7 +92,7 @@ def create_database():
     # Create/maintain database connection
     conn = psycopg2.connect(
         host='',
-        database="postgres",
+        database="papers",
         user="postgres"
     )
     conn.autocommit = True  # Needed for database creation
@@ -100,14 +100,14 @@ def create_database():
     try:
         with conn.cursor() as cursor:
             # Create database if not exists
-            cursor.execute("CREATE DATABASE postgres")
+            cursor.execute("CREATE DATABASE papers")
     except psycopg2.errors.DuplicateDatabase:
         pass
     
     # Connect to the new database
     conn = psycopg2.connect(
         host='',
-        database="postgres",
+        database="papers",
         user="postgres"
     )
     
@@ -853,9 +853,9 @@ inspect_papers(conn)
 # %%
 def backup_database():
     """Backup PostgreSQL database to Google Drive"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print(f"Creating PostgreSQL backup at {backup_path}")
-    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
+    !pg_dump -U postgres -F c -f "{backup_path}" papers  # pyright: ignore
     print("Backup completed successfully")
 
 # Run backup after saving data

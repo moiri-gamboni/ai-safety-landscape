@@ -34,14 +34,57 @@ def get_db_connection():
         user="postgres"
     )
 
+def cleanup_database():
+    """Permanently remove non-target papers and analysis tables"""
+    with conn.cursor() as cursor:
+        print("Purging non-relevant data...")
+        
+        # Delete from related tables first
+        cursor.execute('''
+            DELETE FROM paper_versions
+            WHERE paper_id IN (
+                SELECT id FROM papers 
+                WHERE categories !~ %s
+            )
+        ''', (get_category_regex(),))
+
+        cursor.execute('''
+            DELETE FROM paper_authors
+            WHERE paper_id IN (
+                SELECT id FROM papers 
+                WHERE categories !~ %s
+            )
+        ''', (get_category_regex(),))
+
+        # Completely remove analysis tables
+        cursor.execute('DROP TABLE IF EXISTS artifacts, cluster_trees CASCADE')
+
+        # Delete orphaned authors
+        cursor.execute('''
+            DELETE FROM authors
+            WHERE id NOT IN (
+                SELECT author_id FROM paper_authors
+            )
+        ''')
+
+        # Finally delete non-target papers
+        cursor.execute('''
+            DELETE FROM papers
+            WHERE categories !~ %s
+        ''', (get_category_regex(),))
+        
+        conn.commit()
+
 def load_database():
-    """Load PostgreSQL backup using psql"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    """Load and filter PostgreSQL backup"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print("Loading PostgreSQL backup...")
-    !psql -U postgres -d papers -f "{backup_path}" # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -f "{backup_path}" # pyright: ignore
+    
 
 load_database()
 conn = get_db_connection()
+cleanup_database()
 
 # %%
 from google import genai
@@ -375,26 +418,10 @@ validate_labels()
 # %%
 # Save duplicates to Drive
 def backup_database():
-    """Backup only labeled papers using pg_dump"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_labeled.sql"
-    
-    # Create temporary view for labeled papers
-    with conn.cursor() as cursor:
-        cursor.execute('''
-            CREATE OR REPLACE VIEW labeled_papers AS
-            SELECT * FROM papers
-            WHERE categories ~ %s
-              AND category IS NOT NULL
-        ''', (get_category_regex(),))
-    
-    # Dump the view instead of entire table
-    !pg_dump -U postgres -F p -f "{backup_path}" -t labeled_papers papers # pyright: ignore
-    
-    # Clean up view
-    with conn.cursor() as cursor:
-        cursor.execute('DROP VIEW IF EXISTS labeled_papers')
-    
-    print(f"Backup saved to {backup_path}")
+    """Backup entire (now filtered) database"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
+    !pg_dump -U postgres -F c -f "{backup_path}" papers # pyright: ignore
+    print(f"Full filtered backup saved to {backup_path}")
 
 # Call backup after processing
 backup_database()

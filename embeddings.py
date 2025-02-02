@@ -66,19 +66,18 @@ else:
 vo = voyageai.Client()
 
 # Path to database
-db_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+db_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
 
 def load_database():
     """Load PostgreSQL backup using psql"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
     print("Loading PostgreSQL backup...")
-    !psql -U postgres -d postgres -f "{backup_path}" # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -f "{db_path}" # pyright: ignore
 
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
     conn = psycopg2.connect(
         host='',
-        database="postgres",
+        database="papers",
         user="postgres"
     )
     return conn
@@ -711,8 +710,8 @@ print(f"Duplicates saved to Drive")
 
 def backup_embeddings():
     """Use pg_dump for PostgreSQL backups"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
-    !pg_dump -U postgres -F p -f "{backup_path}" postgres # pyright: ignore
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
+    !pg_dump -U postgres -F c -f "{backup_path}" papers # pyright: ignore
 
 # Call backup after processing
 backup_embeddings()

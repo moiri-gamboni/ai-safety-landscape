@@ -39,7 +39,7 @@ def get_optuna_storage():
 # Add database loading from Drive backup
 def load_database():
     """Load PostgreSQL backup using psql"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print("Loading PostgreSQL backup...")
     !psql -U postgres -d postgres -f "{backup_path}" # pyright: ignore
 
@@ -222,5 +222,5 @@ verify_database()
 # ## 5. Create Final Backup
 
 # %%
-!pg_dump -U postgres -d {DEST_DB} -F c -f /content/drive/MyDrive/ai-safety-papers/filtered.db # pyright: ignore
+!pg_dump -U postgres -d {DEST_DB} -F c -f /content/drive/MyDrive/ai-safety-papers/papers.sql # pyright: ignore
 print("Filtered database backup created successfully") 

@@ -45,7 +45,7 @@ from tqdm import tqdm
 import numpy as np
 
 # Path to SQLite database
-sqlite_path = "/content/drive/MyDrive/ai-safety-papers/papers.db"
+sqlite_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
 
 # Connect to SQLite
 sqlite_conn = sqlite3.connect(sqlite_path)
@@ -55,7 +55,7 @@ sqlite_conn.row_factory = sqlite3.Row
 # Connect to default postgres database
 postgres_conn = psycopg2.connect(
     host='',
-    database="postgres",
+    database="papers",
     user="postgres"
 )
 postgres_conn.autocommit = False
@@ -340,12 +340,12 @@ validate_migration(sqlite_conn, postgres_conn)
 # %%
 def backup_postgres_db():
     """Backup PostgreSQL database to Google Drive"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     
     print(f"Creating PostgreSQL backup at {backup_path}")
     
     # Remove -h localhost to use peer authentication instead of password
-    !pg_dump -U postgres -F p -f {backup_path} postgres # pyright: ignore
+    !pg_dump -U postgres -F c -f {backup_path} papers # pyright: ignore
     
     print("Backup completed successfully")
 

@@ -71,7 +71,7 @@ from joblib import parallel_backend
 
 # %%
 # Database configuration
-db_backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+db_backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
 
 def get_db_connection():
     """Create PostgreSQL connection with retries"""
@@ -80,14 +80,14 @@ def get_db_connection():
     
     return psycopg2.connect(
         host='',  # Empty string for Unix socket connection
-        database="postgres",
+        database="papers",
         user="postgres",
         cursor_factory=DictCursor
     )
 
 # After creating connection but before creating tables:
 print("Loading existing database...")
-!psql -U postgres -d postgres -f "{db_backup_path}" # pyright: ignore
+!pg_restore -U postgres --jobs=8 -f "{backup_path}" # pyright: ignore
 conn = get_db_connection()
 
 # %%
@@ -401,9 +401,9 @@ def objective(trial, scaled_embeddings, knn_graph):
 
 def backup_database():
     """Backup PostgreSQL database to Google Drive"""
-    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers_postgres.sql"
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print(f"Creating PostgreSQL backup at {backup_path}")
-    !pg_dump -U postgres -F p -f "{backup_path}" postgres  # pyright: ignore
+    !pg_dump -U postgres -F c -f "{backup_path}" papers  # pyright: ignore
     print("Backup completed successfully")
 
 # Combined backup callback that saves both sampler and database
