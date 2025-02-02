@@ -48,6 +48,8 @@ from tenacity import (
 )
 import re
 from psycopg2.extras import DictCursor
+from cuml.preprocessing import StandardScaler
+from cuml.neighbors import NearestNeighbors
 
 # Load API key from Colab form or environment
 if 'COLAB_GPU' in os.environ:
@@ -89,43 +91,21 @@ conn = connect_db()
 # %% [markdown]
 # ### Column Reset (Run when reprocessing)
 # %%
-def drop_embedding_column():
-    """Drop the embedding column for reprocessing"""
-    with conn.cursor() as cursor:
-        cursor.execute('''
-            ALTER TABLE papers 
-            DROP COLUMN IF EXISTS abstract_embedding
-        ''')
-        conn.commit()
-    print("Dropped abstract_embedding column")
-
-drop_embedding_column()
-
-# %%
-def create_columns():
+def create_column():
     # Check for embedding column
     with conn.cursor() as cursor:
+        print("Adding embedding column...")
         cursor.execute('''
-            SELECT EXISTS (
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name = 'papers' 
-                AND column_name = 'embedding'
-            )
+            ALTER TABLE papers 
+            ADD COLUMN IF NOT EXISTS embedding BYTEA
         ''')
-        if not cursor.fetchone()[0]:
-            print("Adding embedding column...")
-            cursor.execute('''
-                ALTER TABLE papers 
-                ADD COLUMN embedding BYTEA
-            ''')
-            cursor.execute('''
-                CREATE INDEX idx_embedding_not_null 
-                ON papers ((embedding IS NOT NULL)) 
-            ''')
-            conn.commit()
+        cursor.execute('''
+            ALTER TABLE papers 
+            ADD COLUMN IF NOT EXISTS scaled_embedding BYTEA
+        ''')
+        conn.commit()
 
-create_columns()
+create_column()
 
 # %% [markdown]
 # ## 3. Embedding Generation
@@ -183,45 +163,40 @@ def embed_with_backoff(texts, model="voyage-3-large"):
     )
 
 def get_csai_papers(conn: psycopg2.extensions.connection, batch_size: int = 128):
-    """Generator that yields batches of papers with cs.AI in their categories
-    
-    Args:
-        conn: Database connection
-        batch_size: Maximum number of papers per batch
-    """
+    """Generator that yields batches of papers needing embeddings"""
     cursor = conn.cursor(cursor_factory=DictCursor)
     
     # First get total count for progress bar
     cursor.execute('''
-        WITH split_categories AS (
-            SELECT id, title, abstract
+        WITH relevant_papers AS (
+            SELECT id, title, abstract, llm_category
             FROM papers
-            WHERE categories LIKE '%cs.AI%'
-              AND title IS NOT NULL
+            WHERE title IS NOT NULL
               AND abstract IS NOT NULL
               AND embedding IS NULL
         )
-        SELECT COUNT(*) FROM split_categories
+        SELECT COUNT(*) FROM relevant_papers
     ''')
     total_papers = cursor.fetchone()[0]
     
     # Then fetch papers in batches
     cursor.execute('''
-        WITH split_categories AS (
-            SELECT id, title, abstract
+        WITH relevant_papers AS (
+            SELECT id, title, abstract, llm_category
             FROM papers
-            WHERE categories LIKE '%cs.AI%'
-              AND title IS NOT NULL
+            WHERE title IS NOT NULL
               AND abstract IS NOT NULL
               AND embedding IS NULL
         )
-        SELECT id, title, abstract FROM split_categories
+        SELECT id, title, abstract, llm_category FROM relevant_papers
     ''')
     
     batch = []
     with tqdm(total=total_papers, desc="Processing papers", unit=" papers") as pbar:
         for row in cursor:
-            batch.append((row['id'], f"{row['title']}\n{row['abstract']}"))
+            # Combine category with title/abstract
+            combined_text = f"Category: {row['llm_category']}\n{row['title']}\n{row['abstract']}"
+            batch.append((row['id'], combined_text))
             if len(batch) >= batch_size:
                 pbar.update(len(batch))
                 yield batch
@@ -311,404 +286,201 @@ def process_batch(batch: List[Tuple[str, str]], model: str = "voyage-3-large") -
         print(f"First text: {texts[0][:500]}...")  # Truncate long texts
         raise
 
-# Process in batches
-total_updated = 0
-batches_processed = 0
-total_tokens = 0
+def scale_and_store_embeddings():
+    """Scale embeddings using StandardScaler and store in database"""
+    print("\nScaling embeddings...")
+    
+    # Load all raw embeddings
+    cursor = conn.cursor(cursor_factory=DictCursor)
+    cursor.execute('SELECT id, embedding FROM papers WHERE embedding IS NOT NULL')
+    papers = cursor.fetchall()
+    
+    if not papers:
+        print("No embeddings found to scale")
+        return
+    
+    # Convert to numpy array
+    embeddings = np.array([np.frombuffer(p['embedding'], dtype=np.float32) for p in papers])
+    
+    # Scale embeddings
+    scaler = StandardScaler()
+    scaled_embeddings = scaler.fit_transform(embeddings)
+    
+    # Store scaled embeddings
+    with conn.cursor() as update_cursor:
+        for p, scaled_emb in zip(papers, scaled_embeddings):
+            update_cursor.execute('''
+                UPDATE papers
+                SET scaled_embedding = %s
+                WHERE id = %s
+            ''', (scaled_emb.astype(np.float32).tobytes(), p['id']))
+        conn.commit()
+    print(f"Scaled {len(papers)} embeddings")
 
-try:
-    for batch in get_csai_papers(conn, batch_size):
-        if max_batches is not None and batches_processed >= max_batches:
-            print(f"\nStopping after {max_batches} batch(es) as requested")
-            break
+def generate_embeddings():
+    # Process in batches
+    total_updated = 0
+    batches_processed = 0
+    total_tokens = 0
+
+    try:
+        for batch in get_csai_papers(conn, batch_size):
+            if max_batches is not None and batches_processed >= max_batches:
+                print(f"\nStopping after {max_batches} batch(es) as requested")
+                break
+                
+            # Split batch if needed to respect token limit
+            sub_batches = adjust_batch_for_token_limit(batch)
             
-        # Split batch if needed to respect token limit
-        sub_batches = adjust_batch_for_token_limit(batch)
-        
-        for i, sub_batch in enumerate(sub_batches):
-            try:
-                # Process batch and get embeddings
-                results, batch_tokens = process_batch(sub_batch)
-                if not isinstance(results, list):
-                    print(f"Warning: results is not a list, got {type(results)}")
-                    print(f"Results value: {results}")
-                    raise ValueError(f"Expected list result, got {type(results)}")
-                
-                # Store in database
-                cursor = conn.cursor()
-                for paper_id, embedding in results:
-                    embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
-                    cursor.execute('''
-                        UPDATE papers
-                        SET embedding = %s
-                        WHERE id = %s
-                    ''', (embedding_blob, paper_id))
-                
-                conn.commit()
-                total_updated += len(sub_batch)
-                
-                # Update total tokens
-                total_tokens += batch_tokens
-                
-            except Exception as e:
-                print(f"\nFatal error processing sub-batch:")
-                print(f"Exception type: {type(e)}")
-                print(f"Exception args: {e.args}")
-                print(f"Full exception: {repr(e)}")
-                print(f"Sub-batch contents: {sub_batch[:2]}...")
-                raise  # Stop execution here
-        
-        batches_processed += 1
-        if max_batches is not None:
-            print(f"\nProcessed {batches_processed}/{max_batches} batch(es)")
+            for i, sub_batch in enumerate(sub_batches):
+                try:
+                    # Process batch and get embeddings
+                    results, batch_tokens = process_batch(sub_batch)
+                    if not isinstance(results, list):
+                        print(f"Warning: results is not a list, got {type(results)}")
+                        print(f"Results value: {results}")
+                        raise ValueError(f"Expected list result, got {type(results)}")
+                    
+                    # Store in database
+                    cursor = conn.cursor()
+                    for paper_id, embedding in results:
+                        embedding_blob = np.array(embedding, dtype=np.float32).tobytes()
+                        cursor.execute('''
+                            UPDATE papers
+                            SET embedding = %s
+                            WHERE id = %s
+                        ''', (embedding_blob, paper_id))
+                    
+                    conn.commit()
+                    total_updated += len(sub_batch)
+                    
+                    # Update total tokens
+                    total_tokens += batch_tokens
+                    
+                except Exception as e:
+                    print(f"\nFatal error processing sub-batch:")
+                    print(f"Exception type: {type(e)}")
+                    print(f"Exception args: {e.args}")
+                    print(f"Full exception: {repr(e)}")
+                    print(f"Sub-batch contents: {sub_batch[:2]}...")
+                    raise  # Stop execution here
+            
+            batches_processed += 1
+            if max_batches is not None:
+                print(f"\nProcessed {batches_processed}/{max_batches} batch(es)")
 
-except Exception as e:
-    print(f"\nFatal error in embedding generation: {str(e)}")
-    raise
-finally:
-    print(f"\nProcess completed:")
-    print(f"- Total papers processed: {total_updated}")
-    print(f"- Total batches processed: {batches_processed}")
-    print(f"- Total tokens processed: {total_tokens:,}")
+
+    except Exception as e:
+        print(f"\nFatal error in embedding generation: {str(e)}")
+        raise
+    finally:
+        print(f"\nProcess completed:")
+        print(f"- Total papers processed: {total_updated}")
+        print(f"- Total batches processed: {batches_processed}")
+        print(f"- Total tokens processed: {total_tokens:,}")
+
+generate_embeddings()
+scale_and_store_embeddings()
 
 # %% [markdown]
-# ## 4. Data Quality Validation
+# ## 5. KNN Graph Generation
 
 # %%
-import numpy as np
+def generate_knn_graph() -> tuple[np.ndarray, np.ndarray]:
+    """Generate KNN graph for clustering"""
+    print("\nGenerating KNN graph...")
+    
+    # Load all scaled embeddings
+    cursor = conn.cursor(cursor_factory=DictCursor)
+    cursor.execute('SELECT id, scaled_embedding FROM papers WHERE scaled_embedding IS NOT NULL')
+    papers = cursor.fetchall()
+    
+    if not papers:
+        raise ValueError("No scaled embeddings found in database")
+    
+    # Convert to numpy array
+    embeddings = np.array([np.frombuffer(row['scaled_embedding'], dtype=np.float32) for row in papers])
+    
+    # Create KNN graph
+    print("Computing 100-NN graph...")
+    nn_model = NearestNeighbors(n_neighbors=100, metric='cosine')
+    nn_model.fit(embeddings)
+    distances, indices = nn_model.kneighbors(embeddings)
+    
+    # Save to Drive
+    save_path = "/content/drive/MyDrive/ai-safety-papers/knn_graph.npz"
+    np.savez_compressed(save_path, distances=distances, indices=indices)
+    print(f"Saved KNN graph to {save_path}")
+    
+    return distances, indices
 
-def validate_embeddings(conn):
-    """Run quality checks on generated embeddings"""
+distances, indices = generate_knn_graph()
+
+# %% [markdown]
+# ## 6. Validation Metrics
+
+# %%
+def validate_embeddings(distances: np.ndarray, indices: np.ndarray) -> dict:
+    """Run quality checks using precomputed KNN graph"""
     # Set fixed seeds for reproducibility
     np.random.seed(42)
     
-    cursor = conn.cursor(cursor_factory=DictCursor)
-    
     print("\n=== Embedding Quality Checks ===")
     
-    # 1. Coverage Check
-    cursor.execute('''
-        SELECT 
-            COUNT(*) AS total_csai,
-            SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) AS with_embedding,
-            SUM(CASE WHEN embedding IS NULL THEN 1 ELSE 0 END) AS without_embedding
-        FROM papers 
-        WHERE categories LIKE '%cs.AI%'
-          AND title IS NOT NULL
-          AND abstract IS NOT NULL
-    ''')
-    stats = cursor.fetchone()
-    print(f"\n1. Coverage:")
-    print(f"- Total CS.AI papers: {stats['total_csai']}")
-    print(f"- With embeddings: {stats['with_embedding']} ({(stats['with_embedding']/stats['total_csai'])*100:.1f}%)")
-    print(f"- Missing embeddings: {stats['without_embedding']} ({(stats['without_embedding']/stats['total_csai'])*100:.1f}%)")
+    # Convert distances to similarities (cosine distance = 1 - cosine similarity)
+    similarities = 1 - distances
+    
+    # Calculate metrics directly from in-memory graph
+    avg_similarities = similarities.mean(axis=1)
+    similarity_variances = similarities.var(axis=1)
+    
+    # Global statistics
+    global_mean = avg_similarities.mean()
+    global_std = avg_similarities.std()
+    var_mean = similarity_variances.mean()
+    var_std = similarity_variances.std()
+    
+    # Outlier detection (2σ thresholds)
+    outlier_mask = (
+        (avg_similarities < (global_mean - 2 * global_std)) |
+        (similarity_variances > (var_mean + 2 * var_std))
+    )
+    outlier_count = np.sum(outlier_mask)
+    
+    # Distribution analysis
+    hist, bins = np.histogram(avg_similarities, bins=20, density=True)
+    
+    print("\nNeighborhood Coherence Metrics:")
+    print(f"Global mean similarity: {global_mean:.3f} ± {global_std:.3f}")
+    print(f"Variance stats: {var_mean:.3f} ± {var_std:.3f}")
+    print(f"Outlier papers: {outlier_count} ({outlier_count/len(avg_similarities)*100:.1f}%)")
+    print(f"Similarity range: [{avg_similarities.min():.3f}, {avg_similarities.max():.3f}]")
+    
+    # Plot distribution
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.hist(avg_similarities, bins=20, alpha=0.7)
+    plt.title('Distribution of Neighborhood Similarities')
+    plt.xlabel('Average Similarity Score')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.show()
+    
+    return {
+        'global_mean': global_mean,
+        'global_std': global_std,
+        'var_mean': var_mean,
+        'var_std': var_std,
+        'outlier_count': outlier_count,
+        'similarity_distribution': (hist, bins)
+    }
 
-    # 2. Validity Check (NaN/Zero vectors)
-    cursor.execute('''
-        SELECT embedding 
-        FROM papers 
-        WHERE embedding IS NOT NULL
-    ''')
-    invalid_count = 0
-    total_checked = 0
-    for row in cursor:
-        embedding = np.frombuffer(row['embedding'], dtype=np.float32)
-        if np.isnan(embedding).any():
-            invalid_count += 1
-        elif np.all(embedding == 0):
-            invalid_count += 1
-        total_checked += 1
-    
-    print(f"\n2. Validity (sampled {total_checked}):")
-    print(f"- Invalid embeddings (NaN/zeros): {invalid_count} ({(invalid_count/total_checked)*100:.1f}%)")
-
-    # 3. Norm Analysis
-    cursor.execute('''
-        SELECT embedding 
-        FROM papers 
-        WHERE embedding IS NOT NULL
-    ''')
-    norms = []
-    for row in cursor:
-        embedding = np.frombuffer(row['embedding'], dtype=np.float32)
-        norms.append(np.linalg.norm(embedding))
-    
-    print(f"\n3. Norm Analysis (sample):")
-    print(f"- Mean norm: {np.mean(norms):.2f}")
-    print(f"- Std dev: {np.std(norms):.2f}")
-    print(f"- Min/Max: {np.min(norms):.2f}/{np.max(norms):.2f}")
-
-    # 4. Similarity Analysis
-    # Get random pairs more efficiently
-    cursor.execute('''
-        SELECT id, title, abstract, embedding 
-        FROM papers 
-        WHERE embedding IS NOT NULL
-          AND categories LIKE '%cs.AI%'
-          AND RANDOM() < 0.01  -- Sample ~1% of records
-        LIMIT 10000
-    ''')
-    papers = cursor.fetchall()
-    random_embeddings = np.vstack([np.frombuffer(row['embedding'], dtype=np.float32) for row in papers])
-    
-    # Analyze embedding components
-    print("\n4. Embedding Analysis:")
-    print(f"- Shape: {random_embeddings.shape}")
-    print("- Component statistics:")
-    means = np.mean(random_embeddings, axis=0)
-    stds = np.std(random_embeddings, axis=0)
-    print(f"  Mean of means: {np.mean(means):.3f} ± {np.std(means):.3f}")
-    print(f"  Mean of stds: {np.mean(stds):.3f} ± {np.std(stds):.3f}")
-    print(f"  Component range: [{np.min(random_embeddings):.3f}, {np.max(random_embeddings):.3f}]")
-    
-    # Show distribution of components
-    positive_frac = np.mean(random_embeddings > 0)
-    print(f"  Fraction of positive components: {positive_frac:.3f}")
-    
-    # Compute similarities using dot product (faster for normalized vectors)
-    n_samples = len(random_embeddings)
-    if n_samples > 1:
-        # Generate random pairs of indices
-        idx1 = np.random.randint(0, n_samples, size=1000)
-        idx2 = np.random.randint(0, n_samples, size=1000)
-        # Exclude self-pairs
-        valid_pairs = idx1 != idx2
-        idx1, idx2 = idx1[valid_pairs], idx2[valid_pairs]
-        
-        # Compute dot products (equivalent to cosine similarity for normalized vectors)
-        similarities = np.sum(random_embeddings[idx1] * random_embeddings[idx2], axis=1)
-        
-        print("\n5. Similarity Analysis:")
-        print(f"- Random pairs (n={len(similarities)}):")
-        print(f"  Mean: {np.mean(similarities):.3f} ± {np.std(similarities):.3f}")
-        print(f"  Range: [{np.min(similarities):.3f}, {np.max(similarities):.3f}]")
-        
-        # Print example pairs with different similarity levels
-        print("\nExample pairs:")
-        # Most similar pair
-        most_similar_idx = np.argmax(similarities)
-        print(f"\nMost similar pair (similarity: {similarities[most_similar_idx]:.3f}):")
-        print(f"Paper 1: {papers[idx1[most_similar_idx]]['title']}")
-        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[most_similar_idx]]['id']}")
-        print(f"Abstract 1:\n{papers[idx1[most_similar_idx]]['abstract']}")
-        print(f"\nPaper 2: {papers[idx2[most_similar_idx]]['title']}")
-        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[most_similar_idx]]['id']}")
-        print(f"Abstract 2:\n{papers[idx2[most_similar_idx]]['abstract']}")
-        
-        # Least similar pair
-        least_similar_idx = np.argmin(similarities)
-        print(f"\nLeast similar pair (similarity: {similarities[least_similar_idx]:.3f}):")
-        print(f"Paper 1: {papers[idx1[least_similar_idx]]['title']}")
-        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[least_similar_idx]]['id']}")
-        print(f"Abstract 1:\n{papers[idx1[least_similar_idx]]['abstract']}")
-        print(f"\nPaper 2: {papers[idx2[least_similar_idx]]['title']}")
-        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[least_similar_idx]]['id']}")
-        print(f"Abstract 2:\n{papers[idx2[least_similar_idx]]['abstract']}")
-        
-        # Median similarity pair
-        median_idx = np.argsort(similarities)[len(similarities)//2]
-        print(f"\nMedian similarity pair (similarity: {similarities[median_idx]:.3f}):")
-        print(f"Paper 1: {papers[idx1[median_idx]]['title']}")
-        print(f"URL 1: https://arxiv.org/abs/{papers[idx1[median_idx]]['id']}")
-        print(f"Abstract 1:\n{papers[idx1[median_idx]]['abstract']}")
-        print(f"\nPaper 2: {papers[idx2[median_idx]]['title']}")
-        print(f"URL 2: https://arxiv.org/abs/{papers[idx2[median_idx]]['id']}")
-        print(f"Abstract 2:\n{papers[idx2[median_idx]]['abstract']}")
-    else:
-        print("\n5. Similarity Analysis:")
-        print("Not enough samples for similarity analysis")
-    
-    # 5. Embedding Analysis
-    print("\n5. Embedding Analysis:")
-    
-    def find_outliers(embeddings: np.ndarray, papers: list, n_examples: int = 3):
-        """Find outlier papers based on their similarity to other papers
-        
-        Args:
-            embeddings: Array of embeddings (each normalized to unit length)
-            papers: List of paper records corresponding to embeddings
-            n_examples: Number of outlier examples to show
-        """
-        # Calculate pairwise similarities
-        similarities = np.dot(embeddings, embeddings.T)  # embeddings already normalized
-        
-        # For each paper, get average similarity to other papers
-        # Exclude self-similarity (1.0) from the average
-        avg_similarities = []
-        for i in range(len(similarities)):
-            others = np.concatenate([similarities[i,:i], similarities[i,i+1:]])
-            avg_similarities.append(np.mean(others))
-        
-        avg_similarities = np.array(avg_similarities)
-        
-        # Use IQR method on average similarities
-        q1, q3 = np.percentile(avg_similarities, [25, 75])
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr  # Papers with unusually low average similarity
-        
-        # Find outliers (papers with unusually low average similarity to others)
-        outlier_indices = np.where(avg_similarities < lower_bound)[0]
-        
-        print(f"\nOutlier Analysis:")
-        print(f"- Average similarity stats:")
-        print(f"  Mean: {np.mean(avg_similarities):.3f} ± {np.std(avg_similarities):.3f}")
-        print(f"  Range: [{np.min(avg_similarities):.3f}, {np.max(avg_similarities):.3f}]")
-        print(f"- Found {len(outlier_indices)} outliers ({len(outlier_indices)/len(embeddings)*100:.1f}%)")
-        
-        if len(outlier_indices) > 0:
-            # Sort outliers by average similarity (ascending)
-            sorted_outliers = sorted(zip(outlier_indices, avg_similarities[outlier_indices]), 
-                                   key=lambda x: x[1])
-            
-            print(f"\nTop {n_examples} outliers (lowest average similarity to other papers):")
-            for idx, avg_sim in sorted_outliers[:n_examples]:
-                paper = papers[idx]
-                print(f"\nAverage similarity to other papers: {avg_sim:.3f}")
-                print(f"Title: {paper['title']}")
-                print(f"URL: https://arxiv.org/abs/{paper['id']}")
-                print(f"Abstract:\n{paper['abstract'][:500]}...")
-                
-                # Show a few most and least similar papers to this one
-                sims = similarities[idx]
-                most_similar_idx = np.argsort(sims)[-2]  # -1 would be self
-                least_similar_idx = np.argsort(sims)[0]
-                
-                print(f"\nMost similar paper (similarity: {sims[most_similar_idx]:.3f}):")
-                print(f"Title: {papers[most_similar_idx]['title']}")
-                
-                print(f"\nLeast similar paper (similarity: {sims[least_similar_idx]:.3f}):")
-                print(f"Title: {papers[least_similar_idx]['title']}")
-    
-    # Get sample of embeddings
-    cursor.execute('''
-        SELECT id, title, abstract, embedding
-        FROM papers 
-        WHERE embedding IS NOT NULL
-        LIMIT 1000
-    ''')
-    papers = cursor.fetchall()
-    embeddings = [np.frombuffer(row['embedding'], dtype=np.float32) for row in papers]
-    all_embeddings = np.array(embeddings)
-    
-    # Basic embedding stats
-    print(f"- Shape: {all_embeddings.shape}")
-    print("- Component statistics:")
-    means = np.mean(all_embeddings, axis=0)
-    stds = np.std(all_embeddings, axis=0)
-    print(f"  Mean of means: {np.mean(means):.3f} ± {np.std(means):.3f}")
-    print(f"  Mean of stds: {np.mean(stds):.3f} ± {np.std(stds):.3f}")
-    print(f"  Component range: [{np.min(all_embeddings):.3f}, {np.max(all_embeddings):.3f}]")
-    
-    # Show distribution of components
-    positive_frac = np.mean(all_embeddings > 0)
-    print(f"  Fraction of positive components: {positive_frac:.3f}")
-    
-    # Find outliers using the new method
-    find_outliers(all_embeddings, papers)
-
-# Run validation
-validate_embeddings(conn)
+validation_results = validate_embeddings(distances, indices)
 
 # %% [markdown]
-# ## 5. Duplicate Analysis
+# ## 7. Backup
 
 # %%
-import re
-def find_duplicates(conn, similarity_threshold=0.95, output_file='duplicates.csv'):
-    """Find potential duplicate papers based on title and embedding similarity
-    
-    Args:
-        conn: Database connection
-        similarity_threshold: Minimum similarity to consider as duplicate
-        output_file: Path to save results (CSV)
-    """
-    print("Finding potential duplicates...")
-    
-    def normalize_title(title):
-        """Normalize title for comparison"""
-        if not title:
-            return ""
-        title = title.lower()
-        title = re.sub(r'\bv\d+\b', '', title)
-        title = re.sub(r'arxiv:\d+\.\d+', '', title, flags=re.IGNORECASE)
-        title = re.sub(r'[^\w\s]', '', title)
-        return ' '.join(title.split())
-    
-    # Get papers with embeddings
-    cursor = conn.cursor(cursor_factory=DictCursor)
-    cursor.execute('''
-        SELECT id, title, embedding
-        FROM papers
-        WHERE embedding IS NOT NULL
-          AND withdrawn = false
-    ''')
-    
-    # Group by normalized title
-    title_groups = {}
-    for row in cursor:
-        norm_title = normalize_title(row['title'])
-        if norm_title:  # Skip empty titles
-            if norm_title in title_groups:
-                title_groups[norm_title].append(row)
-            else:
-                title_groups[norm_title] = [row]
-    
-    # Find duplicates based on both title and embedding similarity
-    duplicates = []
-    
-    print(f"Analyzing {len(title_groups)} unique normalized titles...")
-    for title, group in title_groups.items():
-        if len(group) > 1:  # Only process groups with multiple papers
-            # Compare embeddings within group
-            embeddings = np.vstack([np.frombuffer(p['embedding'], dtype=np.float32) for p in group])
-            # Use dot product directly since embeddings are already normalized
-            similarities = np.dot(embeddings, embeddings.T)  # No normalization needed
-            
-            # Find pairs above threshold (excluding self-similarity)
-            for i in range(len(similarities)):
-                for j in range(i+1, len(similarities)):
-                    if similarities[i,j] > similarity_threshold:
-                        duplicates.append({
-                            'id1': group[i]['id'],
-                            'id2': group[j]['id'],
-                            'title': group[i]['title'],
-                            'similarity': float(similarities[i,j])
-                        })
-    
-    # Sort by similarity
-    duplicates.sort(key=lambda x: x['similarity'], reverse=True)
-    
-    # Save results
-    import csv
-    with open(output_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['id1', 'id2', 'title', 'similarity'])
-        writer.writeheader()
-        writer.writerows(duplicates)
-    
-    # Print summary
-    print(f"\nFound {len(duplicates)} potential duplicate pairs")
-    print(f"Results saved to {output_file}")
-    
-    # Print top examples
-    if duplicates:
-        print("\nTop 5 potential duplicates:")
-        for dup in duplicates[:5]:
-            print(f"\nSimilarity: {dup['similarity']:.3f}")
-            print(f"Title: {dup['title']}")
-            print(f"Paper 1: https://arxiv.org/abs/{dup['id1']}")
-            print(f"Paper 2: https://arxiv.org/abs/{dup['id2']}")
-
-# Run duplicate analysis
-find_duplicates(conn)
-
-# %% [markdown]
-# ## 6. Save Results
-
-# %%
-# Save duplicates to Drive
-%cp duplicates.csv "/content/drive/MyDrive/ai-safety-papers/duplicates.csv" # pyright: ignore
-print(f"Duplicates saved to Drive")
-
 def backup_embeddings():
     """Use pg_dump for PostgreSQL backups"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
