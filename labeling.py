@@ -26,6 +26,11 @@ if 'COLAB_GPU' in os.environ:
 # %%
 import psycopg2
 
+VALID_CATEGORIES = [
+    'cs.AI', 'cs.LG', 'cs.GT', 'cs.MA',
+    'cs.LO', 'cs.CY', 'cs.CR', 'cs.SE', 'cs.NE'
+]
+
 def get_db_connection():
     """Create PostgreSQL connection"""
     return psycopg2.connect(
@@ -34,44 +39,70 @@ def get_db_connection():
         user="postgres"
     )
 
+def get_valid_categories():
+    """Return as PostgreSQL array literal"""
+    return "'{" + ",".join(VALID_CATEGORIES) + "}'"
+
 def cleanup_database():
     """Permanently remove non-target papers and analysis tables"""
     with conn.cursor() as cursor:
-        print("Purging non-relevant data...")
+        print("Removing old tables...")
+        cursor.execute('DROP TABLE IF EXISTS alembic_version, artifacts, cluster_trees, studies, study_directions, study_system_attributes, study_user_attributes, trial_heartbeats, trial_intermediate_values, trial_params, trial_system_attributes, trial_user_attributes, trial_values, trials, version_info CASCADE')
+        cursor.execute('DROP INDEX IF EXISTS idx_categories, idx_embedding_not_null, idx_updated, ix_studies_study_name, ix_trials_study_id')
+
+        print("Optimizing category filtering...")
+        cursor.execute(f'''
+            ALTER TABLE papers 
+            ADD COLUMN IF NOT EXISTS arxiv_categories TEXT[]
+            GENERATED ALWAYS AS (
+                string_to_array(categories, ' ')
+            ) STORED
+        ''')
         
-        # Delete from related tables first
+        print("Creating GIN index...")
         cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_paper_categories_arr 
+            ON papers USING GIN(arxiv_categories)
+        ''')
+                
+        print("Deleting paper_versions records...")
+        cursor.execute(f'''
             DELETE FROM paper_versions
             WHERE paper_id IN (
-                SELECT id FROM papers 
-                WHERE categories !~ %s
+                SELECT id 
+                FROM papers 
+                WHERE NOT arxiv_categories && {get_valid_categories()}
             )
-        ''', (get_category_regex(),))
-
-        cursor.execute('''
+        ''')
+        
+        print("Deleting paper_authors records...")
+        cursor.execute(f'''
             DELETE FROM paper_authors
             WHERE paper_id IN (
                 SELECT id FROM papers 
-                WHERE categories !~ %s
-            )
-        ''', (get_category_regex(),))
-
-        # Completely remove analysis tables
-        cursor.execute('DROP TABLE IF EXISTS artifacts, cluster_trees CASCADE')
-
-        # Delete orphaned authors
-        cursor.execute('''
-            DELETE FROM authors
-            WHERE id NOT IN (
-                SELECT author_id FROM paper_authors
+                WHERE NOT arxiv_categories && {get_valid_categories()}
             )
         ''')
-
-        # Finally delete non-target papers
-        cursor.execute('''
+        
+        print("Deleting non-target papers...")
+        cursor.execute(f'''
             DELETE FROM papers
-            WHERE categories !~ %s
-        ''', (get_category_regex(),))
+            WHERE NOT arxiv_categories && {get_valid_categories()}
+        ''')
+
+        print("Dropping original categories column...")
+        cursor.execute('''
+            ALTER TABLE papers 
+            DROP COLUMN IF EXISTS categories
+        ''')
+        
+        print("Deleting orphaned authors...")
+        cursor.execute('''
+            DELETE FROM authors a
+            USING authors
+            LEFT JOIN paper_authors pa ON a.id = pa.author_id
+            WHERE pa.author_id IS NULL
+        ''')
         
         conn.commit()
 
@@ -109,16 +140,6 @@ else:
 MODEL_ID = "gemini-2.0-flash-exp"
 
 # %%
-VALID_CATEGORIES = [
-    'cs.AI', 'cs.LG', 'cs.GT', 'cs.MA',
-    'cs.LO', 'cs.CY', 'cs.CR', 'cs.SE', 'cs.NE'
-]
-
-def get_category_regex():
-    """Generate PostgreSQL regex pattern for valid categories"""
-    return r'\m(' + '|'.join(VALID_CATEGORIES) + r')\M'
-
-# %%
 def create_label_columns():
     """Create columns for labeling results matching db_schema.md"""
     with conn.cursor() as cursor:
@@ -126,12 +147,12 @@ def create_label_columns():
             SELECT column_name 
             FROM information_schema.columns 
             WHERE table_name = 'papers' 
-            AND column_name IN ('category', 'safety_relevance', 'label_confidence')
+            AND column_name IN ('llm_category', 'safety_relevance', 'label_confidence')
         ''')
         existing_columns = {row[0] for row in cursor.fetchall()}
         
-        if 'category' not in existing_columns:
-            cursor.execute('ALTER TABLE papers ADD COLUMN category TEXT')
+        if 'llm_category' not in existing_columns:
+            cursor.execute('ALTER TABLE papers ADD COLUMN llm_category TEXT')
         if 'safety_relevance' not in existing_columns:
             cursor.execute('ALTER TABLE papers ADD COLUMN safety_relevance FLOAT')
         if 'label_confidence' not in existing_columns:
@@ -143,31 +164,29 @@ create_label_columns()
 
 # %%
 def get_paper_batches(batch_size=400):
-    """Generator yielding batches of papers with target categories"""
+    """Generator yielding batches of papers needing labeling"""
     cursor = conn.cursor(cursor_factory=DictCursor)
     
-    # Get total count using schema-defined categories column
+    # Get total count of papers needing labels
     cursor.execute('''
         SELECT COUNT(*) 
         FROM papers 
-        WHERE categories ~ %s
+        WHERE llm_category IS NULL
           AND title IS NOT NULL
           AND abstract IS NOT NULL
-          AND category IS NULL
-    ''', (get_category_regex(),))
+    ''')
     
     total_papers = cursor.fetchone()[0]
     
-    # Batch query using proper schema relationships
+    # Simplified query without category filtering
     cursor.execute('''
-        SELECT p.id, p.title, p.abstract 
-        FROM papers p
-        WHERE categories ~ %s
-          AND p.title IS NOT NULL
-          AND p.abstract IS NOT NULL
-          AND p.category IS NULL
-        ORDER BY p.id
-    ''', (get_category_regex(),))
+        SELECT id, title, abstract 
+        FROM papers
+        WHERE llm_category IS NULL
+          AND title IS NOT NULL
+          AND abstract IS NOT NULL
+        ORDER BY id
+    ''')
     
     batch = []
     with tqdm(total=total_papers, desc="Processing papers", unit=" papers") as pbar:
@@ -290,10 +309,10 @@ token_tracker = TokenTracker()
 @retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
 def generate_labels(batch):
     """Generate labels for a batch of papers using Gemini"""
-    base_prompt = """You are an expert in AI safety and machine learning. Your task is to categorize academic papers and assess their relevance to AI safety.
+    base_prompt = """You are an expert in AI safety and machine learning. Your task is to analyze academic papers and assess their relevance to AI safety.
 
 For each paper, provide:
-1. A specific technical category that precisely describes the primary research focus (e.g. "Adversarial Attack Detection" rather than "AI Safety", or "Reward Modeling for RLHF" rather than "Reinforcement Learning")
+1. A specific technical category that precisely describes the primary research focus
 2. A relevance score (0-1) indicating how relevant it is to AI safety research
 3. Your confidence (0-1) in this categorization
 
@@ -355,7 +374,7 @@ def process_batches():
                 for paper, label in zip(batch, labels):
                     cursor.execute('''
                         UPDATE papers
-                        SET category = %s,
+                        SET llm_category = %s,
                             safety_relevance = %s,
                             label_confidence = %s
                         WHERE id = %s
@@ -383,20 +402,19 @@ process_batches()
 
 # %%
 def validate_labels():
-    """Validate labeling results using schema-defined relationships"""
+    """Validate labeling results"""
     cursor = conn.cursor(cursor_factory=DictCursor)
     
     print("\n=== Labeling Quality Checks ===")
     
-    # Coverage check using proper schema columns
+    # Check coverage of labeling process
     cursor.execute('''
         SELECT 
             COUNT(*) AS total,
-            SUM(CASE WHEN category IS NOT NULL THEN 1 ELSE 0 END) AS labeled,
-            SUM(CASE WHEN category IS NULL THEN 1 ELSE 0 END) AS unlabeled
+            SUM(CASE WHEN llm_category IS NOT NULL THEN 1 ELSE 0 END) AS labeled,
+            SUM(CASE WHEN llm_category IS NULL THEN 1 ELSE 0 END) AS unlabeled
         FROM papers
-        WHERE categories ~ %s
-    ''', (get_category_regex(),))
+    ''')
     
     stats = cursor.fetchone()
     print(f"Label coverage: {stats['labeled']}/{stats['total']} ({stats['labeled']/stats['total']*100:.1f}%)")
