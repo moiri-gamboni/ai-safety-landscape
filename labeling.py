@@ -309,10 +309,10 @@ token_tracker = TokenTracker()
 @retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
 def generate_labels(batch):
     """Generate labels for a batch of papers using Gemini"""
-    base_prompt = """You are an expert in AI safety and machine learning. Your task is to analyze academic papers and assess their relevance to AI safety.
+    base_prompt = """You are an expert in AI safety and machine learning. Your task is to categorize academic papers and assess their relevance to AI safety.
 
 For each paper, provide:
-1. A specific technical category that precisely describes the primary research focus
+1. A specific technical category that precisely describes the primary research focus (e.g. "Adversarial Attack Detection" rather than "AI Safety", or "Reward Modeling for RLHF" rather than "Reinforcement Learning")
 2. A relevance score (0-1) indicating how relevant it is to AI safety research
 3. Your confidence (0-1) in this categorization
 
