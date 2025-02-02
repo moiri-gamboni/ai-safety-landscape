@@ -18,7 +18,7 @@ if 'COLAB_GPU' in os.environ:
     !sudo sed -i 's/local\s*all\s*postgres\s*peer/local all postgres trust/' /etc/postgresql/14/main/pg_hba.conf # pyright: ignore
     !sudo service postgresql restart # pyright: ignore
     
-    %pip install psycopg2-binary tqdm tenacity google-genai # pyright: ignore
+    %pip install psycopg2-binary tqdm tenacity google-genai pydantic # pyright: ignore
 
 # %% [markdown]
 # ## 2. Load Database
@@ -178,21 +178,20 @@ from tqdm.auto import tqdm
 import json
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from psycopg2.extras import DictCursor
-from typing import List, TypedDict
 import time
 from google.genai import types
+from pydantic import BaseModel
 
 # Configure Gemini API
-if 'COLAB_GPU' in os.environ:
-    # @title Gemini API Key
-    gemini_api_key = "" # @param {type:"string"}
-    client = genai.Client(api_key=gemini_api_key)
-else:
-    from dotenv import load_dotenv
-    load_dotenv()
-    client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+# @title Gemini API Key
+gemini_api_key = "" # @param {type:"string"}
+client = genai.Client(api_key=gemini_api_key)
 
 MODEL_ID = "gemini-2.0-flash-exp"
+class PaperLabel(BaseModel):
+    category: str
+    relevance_score: float
+    confidence: float
 
 # %%
 def create_label_columns():
@@ -226,9 +225,7 @@ def get_paper_batches(batch_size=400):
     cursor.execute('''
         SELECT COUNT(*) 
         FROM papers 
-        WHERE llm_category IS NULL
-          AND title IS NOT NULL
-          AND abstract IS NOT NULL
+
     ''')
     
     total_papers = cursor.fetchone()[0]
@@ -237,9 +234,6 @@ def get_paper_batches(batch_size=400):
     cursor.execute('''
         SELECT id, title, abstract 
         FROM papers
-        WHERE llm_category IS NULL
-          AND title IS NOT NULL
-          AND abstract IS NOT NULL
         ORDER BY id
     ''')
     
@@ -255,17 +249,6 @@ def get_paper_batches(batch_size=400):
             pbar.update(len(batch))
             yield batch
 
-# %%
-class PaperLabel(TypedDict):
-    category: str
-    relevance_score: float
-    confidence: float
-
-model = genai.GenerativeModel("models/gemini-2.0-flash-exp")
-generation_config = genai.GenerationConfig(
-    response_mime_type="application/json",
-    response_schema=List[PaperLabel],
-)
 
 # %%
 # Rate limiter class matching Gemini 1.5 Flash limits
@@ -381,13 +364,14 @@ Papers to analyze:
 """
     
     prompt = base_prompt
+    batch_size = len(batch)
     for paper in batch:
         prompt += f"\n\nTitle: {paper['title']}\nAbstract: {paper['abstract']}"
-    
+
     # Count tokens
     count_response = client.models.count_tokens(
         model=MODEL_ID,
-        contents=prompt
+        contents=prompt,
     )
     input_tokens = count_response.total_tokens
     
@@ -395,7 +379,15 @@ Papers to analyze:
     response = client.models.generate_content(
         model=MODEL_ID,
         contents=prompt,
-        generation_config=generation_config
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=types.Schema(
+                type="ARRAY",
+                items=PaperLabel,
+                min_items=batch_size,
+                max_items=batch_size
+            ),
+        ),
     )
     
     if not response.usage_metadata:
