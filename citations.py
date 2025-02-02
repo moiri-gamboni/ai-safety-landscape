@@ -45,7 +45,8 @@ def load_database():
     """Load PostgreSQL backup using psql"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
     print("Loading PostgreSQL backup...")
-    !pg_restore -U postgres --jobs=8 -f "{backup_path}" # pyright: ignore
+    !createdb -U postgres papers # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -d papers "{backup_path}" # pyright: ignore
 
 load_database()
 conn = get_db_connection()

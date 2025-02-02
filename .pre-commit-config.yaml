@@ -3,8 +3,18 @@ repos:
     hooks:
     -   id: jupytext
         name: jupytext
-        entry: bash -c 'jupytext --to notebook "$1" && git add "${1%.*}.ipynb"' --
+        entry: |
+            bash -c '
+            ipynb_files=()
+            for f in "$@"; do
+                jupytext --to notebook "$f"
+                ipynb_files+=("${f%.py}.ipynb")
+            done
+            # Single atomic git add operation
+            git add -- "${ipynb_files[@]}"
+            '
         language: python
         additional_dependencies: [jupytext]
         files: ^.*\.py$
         stages: [pre-commit]
+        pass_filenames: true

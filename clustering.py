@@ -87,7 +87,8 @@ def get_db_connection():
 
 # After creating connection but before creating tables:
 print("Loading existing database...")
-!pg_restore -U postgres --jobs=8 -f "{backup_path}" # pyright: ignore
+!createdb -U postgres papers # pyright: ignore
+!pg_restore -U postgres --jobs=8 -d papers "{backup_path}" # pyright: ignore
 conn = get_db_connection()
 
 # %%

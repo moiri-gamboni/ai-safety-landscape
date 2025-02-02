@@ -54,7 +54,8 @@ def load_existing_database():
     """Load existing PostgreSQL database from backup"""
     print("Loading PostgreSQL backup...")
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
-    !pg_restore -U postgres --progress --jobs=4 -f "{backup_path}"  # pyright: ignore
+    !createdb -U postgres papers # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -d papers "{backup_path}" # pyright: ignore
     return psycopg2.connect(
         host='',
         database="papers",
