@@ -141,6 +141,14 @@ def cleanup_database():
         conn.commit()
 
     with conn.cursor() as cursor:
+        print("Optimizing author query index...")
+        cursor.execute('''
+            CREATE INDEX idx_author_papers 
+            ON paper_authors (author_id) INCLUDE (paper_id)
+        ''')
+    conn.commit()
+
+    with conn.cursor() as cursor:
         print("Vacuuming database...")
         # Allow VACUUM outside transaction block
         conn.autocommit = True
