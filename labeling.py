@@ -45,6 +45,10 @@ def get_valid_categories():
 
 def cleanup_database():
     """Permanently remove non-target papers and analysis tables"""
+    with conn.cursor() as cursor:
+        cursor.execute('SET maintenance_work_mem TO \'5GB\';')
+    conn.commit()
+
     # Remove analysis tables
     with conn.cursor() as cursor:
         print("Removing old tables...")
@@ -125,18 +129,27 @@ def cleanup_database():
 
     with conn.cursor() as cursor:
         print("Deleting orphaned authors...")
+        cursor.execute('CREATE INDEX tmp_author_idx ON paper_authors (author_id)')
         cursor.execute('''
             DELETE FROM authors
-            WHERE id NOT IN (
-                SELECT DISTINCT author_id 
-                FROM paper_authors
+            WHERE NOT EXISTS (
+                SELECT 1 FROM paper_authors 
+                WHERE author_id = authors.id
             )
         ''')
-    conn.commit()
+        cursor.execute('DROP INDEX tmp_author_idx')
+        conn.commit()
 
     with conn.cursor() as cursor:
         print("Vacuuming database...")
+        # Allow VACUUM outside transaction block
+        conn.autocommit = True
         cursor.execute('VACUUM FULL ANALYZE')
+        conn.autocommit = False
+    
+    with conn.cursor() as cursor:
+        cursor.execute('RESET maintenance_work_mem;')
+    conn.commit()
     
     print("Cleanup complete")
 
