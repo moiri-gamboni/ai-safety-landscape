@@ -98,11 +98,11 @@ Papers to analyze:
 ```
 Then, a batch of 10 representative papers, with titles and abstracts, were provided. These papers chosen were those closest to the cluster centroid.
 
-#### Labeling Results
+## Results
 
-Full clustering results are available in [`cluster_results.md`](cluster_results.md).
+Full label tables are available in [`cluster_results.md`](cluster_results.md).
 
-##### Top 20 Clusters by Size
+### Top 20 Clusters by Size
 
 | Size | Label | Safety Relevance |
 |------|-------|------------------|
@@ -128,7 +128,7 @@ Full clustering results are available in [`cluster_results.md`](cluster_results.
 | 631  | Uncertainty Quantification in Neural Networks |       0.80       |
 
 
-##### Top 20 Clusters by Safety Relevance
+### Top 20 Clusters by Safety Relevance
 
 | Safety Relevance | Size | Label |
 |-------------------|------|-------|
@@ -163,7 +163,7 @@ A further 2D UMAP reductions is performed on the original embeddings. This allow
 ![Safety Relevance Heatmap](./safety_heatmap.png)
 ![Noise Points](./noise.png)
 
-### Discussion and future work
+## Discussion and future work
 
 Clearly, there are gaps to the accidental, overly restrictive `cs.AI` category filtering. For example, there are no clusters on existential risk or formal verification. However, the cluster sizes seem reasonable. It would be worth investigating the noise points in more details, as they represent a significant portion of the papers, and might fit in the existing clusters. Finally, it seems that some clusters get spread out in the 2D UMAP reduction, due to the fact that they were clustered in a high-dimensional space. Potentially, we should fix the UMAP reduction to two dimensions, to optimize for visualization clarity rather than raw clustering accuracy, as this is intended for an exploration of the space, rather than a precise clustering task.
 Further refinements to the clustering are possible: for example, a pre-labeling task of the papers might provide a noisy signal that can get added before embeddings to improve downstream clustering. Also, it might be possible to ask an LLM to re-label the clusters after being provided with all the labels, to ensure a coherent taxonomy.
