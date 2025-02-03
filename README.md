@@ -171,3 +171,4 @@ Finally, some obvious tasks to accomplish that were left off due to time:
 1) re-embedding and re-clustering with the right arXiv category filtering
 2) labeling the hierarchical clusters, which might provide a useful taxonomy as in the FLI's AI Safety Landscape. 
 3) a proper interface to search for papers, filter clusters, re-color them, etc. would be extremely valuable.
+4) providing proper access to the database (currently can be found [here](https://drive.google.com/file/d/1k_iExjVp3FwmVvu_MNsqoMUlgVTqkAbA/view?usp=sharing))
