@@ -697,6 +697,52 @@ plot_cluster_persistence(best_clusterer)
 plot_cluster_scatter()
 
 # %%
+def print_cluster_labels_by_size():
+    """Print all cluster labels ordered by cluster size and relevance"""
+    # Get cluster sizes from HDBSCAN labels
+    labels = best_clusterer.labels_.get()
+    unique, counts = np.unique(labels[labels != -1], return_counts=True)
+    cluster_sizes = dict(zip(unique, counts))
+    
+    # Get labels from database
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT cluster_id, label, safety_relevance 
+            FROM cluster_labels
+        ''')
+        cluster_info = {row['cluster_id']: row for row in cursor.fetchall()}
+    
+    # Combine data (excluding cluster IDs)
+    combined = []
+    for cluster_id in cluster_sizes:
+        info = cluster_info.get(cluster_id, {'label': 'No label', 'safety_relevance': None})
+        combined.append((
+            cluster_sizes[cluster_id],
+            info['label'],
+            info['safety_relevance'] or 0  # Treat None as 0 for sorting
+        ))
+    
+    # Create sorted versions
+    by_size = sorted(combined, key=lambda x: x[0], reverse=True)
+    by_relevance = sorted(combined, key=lambda x: x[2], reverse=True)
+    
+    # Print markdown tables
+    print("### Clusters by Size\n")
+    print("| Size | Label | Safety Relevance |")
+    print("|------|-------|------------------|")
+    for size, label, relevance in by_size:
+        rel_str = f"{relevance:.2f}" if relevance else "N/A"
+        print(f"| {size:^4} | {label} | {rel_str:^16} |")
+    
+    print("\n\n### Clusters by Safety Relevance\n")
+    print("| Safety Relevance | Size | Label |")
+    print("|-------------------|------|-------|")
+    for size, label, relevance in by_relevance:
+        rel_str = f"{relevance:.2f}" if relevance else "N/A"
+        print(f"| {rel_str:^17} | {size:^4} | {label} |")
+
+print_cluster_labels_by_size()
+# %%
 def backup_database():
     """Backup PostgreSQL database to Google Drive"""
     backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
