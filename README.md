@@ -72,9 +72,31 @@ The best trial found was # 451, with a relative validity of 0.294. The parameter
 
 #### Clustering Results
 
-HDBSCAN identified 153 clusters, which is about expected given all `cs.AI` papers were clustered, and a high-granularity was sought. However, a relatively high noise ratio of 49.57% indicates that about half of the papers couldn't be confidently assigned to any cluster. While this could mean either emerging research areas or papers that bridge multiple domains, it's more likely that further work should be done on the clustering parameters. The clusters also show considerable variation in size (standard deviation of 402 papers) with a size ratio of 29.6 between the largest and smallest clusters. This could be a mix of the presence of both mainstream research areas and more specialized niches, as well as insufficiently granular clustering. The average cluster probability of 0.43 (±0.45) indicates moderate confidence in the cluster assignments, while the mean persistence of 0.125 suggests the clusters are reasonably stable. The trust score of 0.66 for the UMAP dimensionality reduction demonstrates that the lower-dimensional representation preserved a good portion of the original semantic relationships between papers. The relative validity of 0.2943 cannot be used as a measure of the quality of the clustering directly, and a full score needs to be computed.
+HDBSCAN identified 153 clusters, which is about expected given all `cs.AI` papers were clustered, and a high-granularity was sought. However, a relatively high noise+ ratio of 49.57% indicates that about half of the papers couldn't be confidently assigned to any cluster. While this could mean either emerging research areas or papers that bridge multiple domains, it's more likely that further work should be done on the clustering parameters. The clusters also show considerable variation in size (standard deviation of 402 papers) with a size ratio of 29.6 between the largest and smallest clusters. This could be a mix of the presence of both mainstream research areas and more specialized niches, as well as insufficiently granular clustering. The average cluster probability of 0.43 (±0.45) indicates moderate confidence in the cluster assignments, while the mean persistence of 0.125 suggests the clusters are reasonably stable. The trust score of 0.66 for the UMAP dimensionality reduction demonstrates that the lower-dimensional representation preserved a good portion of the original semantic relationships between papers. The relative validity of 0.2943 cannot be used as a measure of the quality of the clustering directly, and a full score needs to be computed.
 
 > I had issues calculating the full DBCVI score. I suspect there was some bug in how the data was stored in the database, and a new clustering might be needed.
 
 ### Phase 4: Labeling
+
+I used Gemini 1.5 Flash with structured output to label the clusters. I also took the opportunity to add a relevance score to the labels, so that labels could then be filtered for a final visualization. The prompt used was:
+
+```
+You are an expert in AI safety and machine learning. Your task is to generate precise technical labels for clusters of academic papers related to AI research.
+
+I will provide the ten papers most representative of the cluster (closest to the cluster centroid).
+
+Review these papers and provide:
+1. A specific technical category that precisely describes the research area represented by this cluster
+2. A relevance score (0-1) indicating how relevant this research area is to AI safety
+
+Guidelines:
+- Use precise technical terminology
+- Categories should be specific enough to differentiate between related research areas yet broad enough to actually group papers (e.g. "Reward Modeling for RLHF" rather than "Reinforcement Learning" or "Regularizing Hidden States Enables Learning Generalizable Reward Model for RLHF")
+- Consider both direct and indirect relevance to AI safety
+
+Papers to analyze:
+```
+Then, a batch of 10 representative papers, with titles and abstracts, were provided. These papers chosen were those closest to the cluster centroid.
+
+#### Labeling Results
 
