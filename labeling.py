@@ -180,6 +180,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from psycopg2.extras import DictCursor
 import time
 from google.genai import types
+import asyncio
 
 # Configure Gemini API
 # @title Gemini API Key
@@ -302,7 +303,7 @@ token_tracker = TokenTracker()
 
 # %%
 @retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
-def generate_labels(batch):
+async def generate_labels(batch):
     """Generate labels for a batch of papers using Gemini"""
     base_prompt = """You are an expert in AI and machine learning. Your task is to categorize academic papers.
 For each paper, provide a specific technical category using precise technical terminology that describes the primary research focus.
@@ -325,7 +326,7 @@ Papers to analyze:
         "maxItems": batch_size
     }
     
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=MODEL_ID,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -380,55 +381,65 @@ def test_token_count():
 test_token_count()
 
 
-# %%
-def process_batches():
-    """Main processing loop with rate limiting"""
-    for batch in get_paper_batches():
-        try:
-            labels, input_toks, output_toks = generate_labels(batch)
-            
-            # Validate label count matches batch size
-            if len(labels) != len(batch):
-                print(f"Label count mismatch: {len(labels)} vs {len(batch)}")
-                if len(labels) > len(batch):
-                    labels = labels[:len(batch)]  # Truncate extra labels
-                else:
-                    # Leave missing labels as NULL by not updating those papers
-                    print("Warning: Insufficient labels - skipping unlabeled papers")
-                    batch = batch[:len(labels)]  # Truncate batch to match labels
-                
-                print(f"Adjusted labels to {len(labels)} items")
-            
-            # Print batch stats
-            print(f"Processed batch of {len(batch)} papers")
-            print(f"Tokens: {input_toks} in → {output_toks} out")
-            
-            # Update database
-            with conn.cursor() as cursor:
-                for paper, label in zip(batch, labels):
-                    cursor.execute('''
-                        UPDATE papers
-                        SET llm_category = %s
-                        WHERE id = %s
-                    ''', (
-                        label,  # Directly use the string category
-                        paper['id']
-                    ))
-                conn.commit()
-                
-        except Exception as e:
-            print(f"Error processing batch: {str(e)}")
-            conn.rollback()
-    
-    # Print final summary
-    token_tracker.print_summary()
+# %% [markdown]
+# ## 5. Async Labeling Pipeline
 
 # %%
-# Execute the pipeline
-process_batches()
+async def process_batches_async():
+    """Main async processing loop"""
+    try:
+        semaphore = asyncio.Semaphore(10)
+        batches = list(get_paper_batches())
+        
+        async def process_batch(batch):
+            async with semaphore:
+                try:
+                    labels, input_toks, output_toks = await generate_labels(batch)
+                    
+                    # Handle label-batch size mismatch
+                    if len(labels) != len(batch):
+                        print(f"Label mismatch: {len(labels)} vs {len(batch)}")
+                        if len(labels) > len(batch):
+                            labels = labels[:len(batch)]
+                        else:
+                            batch = batch[:len(labels)]
+                        
+                        print(f"Adjusted to {len(labels)} items")
+                    
+                    # Batch update
+                    await asyncio.to_thread(update_batch_in_db, batch, labels)
+                    print(f"Processed {len(batch)} papers | Tokens: {input_toks}→{output_toks}")
+                    
+                except Exception as e:
+                    print(f"Batch error: {str(e)}")
+                    await asyncio.to_thread(conn.rollback)
+        
+        # Process all batches concurrently
+        await asyncio.gather(*[process_batch(b) for b in batches])
+        await asyncio.to_thread(token_tracker.print_summary)
+    finally:
+        await client.aio.close()  # Cleanup async resources
+
+# Update database function
+def update_batch_in_db(batch, labels):
+    with conn.cursor() as cursor:
+        for paper, label in zip(batch, labels):
+            cursor.execute('''
+                UPDATE papers
+                SET llm_category = %s
+                WHERE id = %s
+            ''', (label, paper['id']))
+        conn.commit()
 
 # %% [markdown]
-# ## Data Validation
+# ## 6. Execute Pipeline
+
+# %%
+# Run async pipeline (Jupyter compatible)
+await process_batches_async()
+
+# %% [markdown]
+# ## 7. Data Validation
 
 # %%
 def validate_labels():
@@ -449,14 +460,6 @@ def validate_labels():
     stats = cursor.fetchone()
     print(f"Label coverage: {stats['labeled']}/{stats['total']} ({stats['labeled']/stats['total']*100:.1f}%)")
 
-validate_labels()
-
-# %% [markdown]
-# ## Execution Flow
-
-# %%
-# Run entire pipeline
-process_batches()
 validate_labels()
 
 
