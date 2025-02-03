@@ -153,7 +153,7 @@ Full clustering results are available in [`cluster_results.md`](cluster_results.
 |       0.80        | 155  | Fairness and Bias Mitigation in Recommender Systems |
 |       0.80        | 149  | Game-Theoretic Modeling of Adversarial Interactions in Cybersecurity |
 
-##### Visualization
+### Visualization
 
 A further 2D UMAP reductions is performed on the original embeddings. This allows for a visualization of the clusters. 
 
@@ -163,6 +163,11 @@ A further 2D UMAP reductions is performed on the original embeddings. This allow
 ![Safety Relevance Heatmap](./safety_heatmap.png)
 ![Noise Points](./noise.png)
 
-##### Discussion
+### Discussion and future work
 
-Clearly, there are gaps to the accidental overly restrictive `cs.AI` selection. For example, there are no clusters on existential risk or formal verification. However, the cluster sizes seem reasonable. It would be worth investigating the noise points in more details, as they represent a significant portion of the papers, and might fit in the existing clusters. Finally, it seems that some clusters get spread out in the 2D UMAP reduction, due to the fact that they were clustered in a high-dimensional space. Potentially, 
+Clearly, there are gaps to the accidental, overly restrictive `cs.AI` category filtering. For example, there are no clusters on existential risk or formal verification. However, the cluster sizes seem reasonable. It would be worth investigating the noise points in more details, as they represent a significant portion of the papers, and might fit in the existing clusters. Finally, it seems that some clusters get spread out in the 2D UMAP reduction, due to the fact that they were clustered in a high-dimensional space. Potentially, we should fix the UMAP reduction to two dimensions, to optimize for visualization clarity rather than raw clustering accuracy, as this is intended for an exploration of the space, rather than a precise clustering task.
+Further refinements to the clustering are possible: for example, a pre-labeling task of the papers might provide a noisy signal that can get added before embeddings to improve downstream clustering. Also, it might be possible to ask an LLM to re-label the clusters after being provided with all the labels, to ensure a coherent taxonomy.
+Finally, some obvious tasks to accomplish that were left off due to time: 
+1) re-embedding and re-clustering with the right arXiv category filtering
+2) labeling the hierarchical clusters, which might provide a useful taxonomy as in the FLI's AI Safety Landscape. 
+3) a proper interface to search for papers, filter clusters, re-color them, etc. would be extremely valuable.
