@@ -218,6 +218,8 @@ def get_best_clusterer():
         cluster_selection_epsilon=cluster_params['cluster_selection_epsilon'],
         cluster_selection_method='leaf',
         gen_min_span_tree=True,
+        get_condensed_tree=True,
+        gen_single_linkage=True,
         output_type='cupy'
     ).fit(reduced_embeddings)
     
@@ -449,3 +451,256 @@ async def test_single_cluster_labeling():
 
 # Run test before full processing
 await test_single_cluster_labeling()
+
+# %% [markdown]
+# ## Cluster Visualizations
+
+# %%
+# Visualization imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from scipy.cluster.hierarchy import dendrogram
+
+def get_condensed_tree():
+    """Extract HDBSCAN condensed tree for hierarchy visualization"""
+    return best_clusterer.condensed_tree_
+
+def plot_hdbscan_dendrogram(condensed_tree, size=10):
+    """Visualize HDBSCAN hierarchy using built-in condensed tree"""
+    plt.figure(figsize=(size, size))
+    condensed_tree.plot(select_clusters=True, label_clusters=True)
+    plt.title("HDBSCAN Condensed Tree Hierarchy")
+    plt.show()
+
+def plot_cluster_persistence(clusterer):
+    """Plot cluster persistence metrics"""
+    # Get cluster persistence from database instead of clusterer
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT cluster_id, validity_index as persistence
+            FROM cluster_metrics
+            WHERE trial_id = %s
+        ''', (best_trial,))
+        persistence_data = cursor.fetchall()
+    
+    persistence_df = pd.DataFrame(
+        persistence_data,
+        columns=['cluster_id', 'persistence']
+    ).sort_values('persistence')
+    
+    plt.figure(figsize=(12, 6))
+    sns.barplot(data=persistence_df, x='cluster_id', y='persistence')
+    plt.xlabel('Cluster ID')
+    plt.ylabel('Persistence Score')
+    plt.title('Cluster Persistence Scores')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+def plot_cluster_scatter(figsize=(15, 15)):
+    """Plot clusters using precomputed 2D UMAP embeddings"""
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, a.cluster_prob, a.viz_embedding, cl.label
+        FROM artifacts a
+        LEFT JOIN cluster_labels cl ON a.cluster_id = cl.cluster_id
+        WHERE a.trial_id = %s
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Convert database results to arrays
+    cluster_ids = np.array([r[0] for r in results])
+    probs = np.array([r[1] for r in results])
+    embeddings = np.vstack([np.frombuffer(r[2], dtype=np.float32) for r in results])
+    labels = [r[3] or f'Cluster {r[0]}' for r in results]  # Use label if available
+    
+    # Create plot
+    plt.figure(figsize=figsize)
+    
+    # Plot noise points first
+    noise_mask = cluster_ids == -1
+    if np.any(noise_mask):
+        plt.scatter(
+            embeddings[noise_mask, 0],
+            embeddings[noise_mask, 1],
+            c='lightgray',
+            marker='.',
+            alpha=0.1,
+            label='Noise'
+        )
+    
+    # Get unique clusters with labels
+    unique_clusters = np.unique(cluster_ids[cluster_ids != -1])
+    cluster_labels = {cid: labels[i] for i, cid in enumerate(cluster_ids) if cid != -1}
+    
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_clusters)))
+    
+    for i, cid in enumerate(unique_clusters):
+        mask = cluster_ids == cid
+        plt.scatter(
+            embeddings[mask, 0],
+            embeddings[mask, 1],
+            c=[colors[i]],
+            marker='.',
+            alpha=probs[mask],
+            label=cluster_labels[cid]
+        )
+    
+    plt.title('AI Safety Paper Clusters')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.show()
+
+def calculate_validity_metrics():
+    """Calculate HDBSCAN validity metrics for the best trial"""
+    import hdbscan
+    
+    # Get min_samples parameter from clusterer
+    min_samples = best_clusterer.min_samples
+    
+    # Convert cuML clusterer results to CPU numpy arrays with float64
+    labels = cp.asnumpy(best_clusterer.labels_).astype(int)
+    valid_mask = labels != -1
+    labels = labels[valid_mask]
+    embeddings = cp.asnumpy(reduced_embeddings[valid_mask]).astype(np.float64)
+
+    # Calculate validity without MST parameter
+    validity = hdbscan.validity.validity_index(
+        X=embeddings,
+        labels=labels,
+        metric='euclidean',
+        d=embeddings.shape[1],
+        per_cluster_scores=True
+    )
+
+    # Get density separation using validity tools
+    unique_labels = np.unique(labels)
+    density_separations = []
+    
+    for i in range(len(unique_labels)):
+        for j in range(i+1, len(unique_labels)):
+            c1, c2 = unique_labels[i], unique_labels[j]
+            
+            # Get cluster members
+            cluster1_mask = labels == c1
+            cluster2_mask = labels == c2
+            
+            # Compute core distances for each cluster
+            from sklearn.neighbors import NearestNeighbors
+            
+            # Cluster 1 core distances
+            cluster1_emb = embeddings[cluster1_mask]
+            nbrs1 = NearestNeighbors(n_neighbors=min_samples, metric='euclidean').fit(cluster1_emb)
+            distances1, _ = nbrs1.kneighbors(cluster1_emb)
+            core_distances1 = distances1[:, -1]  # Get min_samples-th neighbor distance
+            
+            # Cluster 2 core distances
+            cluster2_emb = embeddings[cluster2_mask]
+            nbrs2 = NearestNeighbors(n_neighbors=min_samples, metric='euclidean').fit(cluster2_emb)
+            distances2, _ = nbrs2.kneighbors(cluster2_emb)
+            core_distances2 = distances2[:, -1]
+
+            # Compute internal nodes via validity module
+            distances = hdbscan.validity.distances_between_points(
+                X=cluster1_emb,
+                labels=labels[cluster1_mask],
+                cluster_id=c1
+            )[0].astype(np.float64)
+            
+            internal_nodes1 = hdbscan.validity.internal_minimum_spanning_tree(distances)[0]
+            
+            distances = hdbscan.validity.distances_between_points(
+                X=cluster2_emb,
+                labels=labels[cluster2_mask],
+                cluster_id=c2
+            )[0].astype(np.float64)
+            
+            internal_nodes2 = hdbscan.validity.internal_minimum_spanning_tree(distances)[0]
+
+            if len(internal_nodes1) == 0 or len(internal_nodes2) == 0:
+                continue  # Skip clusters without internal nodes
+                
+            sep = hdbscan.validity.density_separation(
+                X=embeddings,
+                labels=labels,
+                cluster_id1=c1,
+                cluster_id2=c2,
+                internal_nodes1=internal_nodes1,
+                internal_nodes2=internal_nodes2,
+                core_distances1=core_distances1,
+                core_distances2=core_distances2
+            )
+            density_separations.append(sep)
+
+    # Store metrics
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cluster_metrics (
+                trial_id INTEGER NOT NULL,
+                cluster_id INTEGER NOT NULL,
+                validity_index REAL,
+                density_separation REAL,
+                PRIMARY KEY (trial_id, cluster_id)
+            )
+        ''')
+        for cluster_id, validity_score in validity[1].items():
+            cursor.execute('''
+                INSERT INTO cluster_metrics 
+                (trial_id, cluster_id, validity_index)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (trial_id, cluster_id) DO UPDATE SET
+                    validity_index = EXCLUDED.validity_index
+            ''', (best_trial, cluster_id, validity_score))
+        conn.commit()
+    
+    return {
+        'overall_validity': validity[0],
+        'mean_density_separation': np.mean(density_separations),
+        'min_density_separation': np.min(density_separations)
+    }
+
+def calculate_and_store_validity_metrics():
+    """Calculate and store validity metrics if missing"""
+    validity_metrics = None
+    with conn.cursor() as cursor:
+        # Check if metrics exist in database
+        cursor.execute('''
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_name = 'cluster_metrics'
+            )
+        ''', (best_trial,))
+        exists = cursor.fetchone()[0]
+        
+        if not exists:
+            # Calculate metrics if missing
+            validity_metrics = calculate_validity_metrics()
+        else:
+            # Check if we have metrics for this trial
+            cursor.execute('''
+                SELECT COUNT(*) FROM cluster_metrics
+                WHERE trial_id = %s
+            ''', (best_trial,))
+            if cursor.fetchone()[0] == 0:
+                validity_metrics = calculate_validity_metrics()
+            else:
+                print("Validity metrics already calculated")
+    return validity_metrics
+
+# Generate visualizations
+# First ensure metrics exist
+validity_metrics = calculate_and_store_validity_metrics()
+condensed_tree = get_condensed_tree()
+plot_hdbscan_dendrogram(condensed_tree)
+plot_cluster_persistence(best_clusterer)
+plot_cluster_scatter()
+
+# %%
+def backup_database():
+    """Backup PostgreSQL database to Google Drive"""
+    backup_path = "/content/drive/MyDrive/ai-safety-papers/papers.sql"
+    print(f"Creating PostgreSQL backup at {backup_path}")
+    !pg_dump -U postgres -F c -f "{backup_path}" papers  # pyright: ignore
+    print("Backup completed successfully")
+backup_database()
