@@ -38,12 +38,12 @@ To improve accuracy of clustering tasks, a dimensionality reduction is often app
 
 I used [optuna](https://optuna.readthedocs.io/en/stable/) for hyperparameter optimization. It allows multiprocessing and can connect to a database backend, which was helpful for resuming tasks. Using the tutorials from [HDBSCAN's documentation](https://hdbscan.readthedocs.io/en/latest/parameter_selection.html) and UMAP ([1](https://umap-learn.readthedocs.io/en/latest/parameters.html) and [2](https://umap-learn.readthedocs.io/en/latest/clustering.html#umap-enhanced-clustering)), I selected the following hyperparameters to optimize:
 
-- `use_umap`: whether to use UMAP for dimensionality reduction. I was curious to see if it would improve the clustering results, as HDBSCAN can supposedly handle high-dimensional data (*indeed, UMAP reduction helped*)
-- `min_cluster_size`: the minimum number of points in a cluster, this is the primary parameter for HDBSCAN.
-- `min_samples`: provides a measure of how conservative the clustering is, the higher it is, the more points will be considered noise.
-- `cluster_selection_epsilon`: allows merging of micro-clusters when min_cluster_size is low. 
-- `n_components`: the number of dimensions in the UMAP embedding.
-- `n_neighbors`: the number of neighbors to use in the UMAP embedding.
+- `use_umap` (range: `[True, False]`): whether to use UMAP for dimensionality reduction. I was curious to see if it would improve the clustering results, as HDBSCAN can supposedly handle high-dimensional data (*indeed, UMAP reduction helped*)
+- `min_cluster_size` (range: `[20, 100]`): the minimum number of points in a cluster, this is the primary parameter for HDBSCAN.
+- `min_samples` (range: `[5, 50]`): provides a measure of how conservative the clustering is, the higher it is, the more points will be considered noise.
+- `cluster_selection_epsilon` (range: `[0.0, 0.5]`): allows merging of micro-clusters when min_cluster_size is low. 
+- `n_components` (range: `[15, 100]`): the number of dimensions in the UMAP embedding.
+- `n_neighbors` (range: `[30, 100]`): the number of neighbors to use in the UMAP embedding.
 
 The following hyperparameters were kept constant:
 - `metric = 'cosine'`: the metric to use for the UMAP embedding. `cosine` is standard for text embeddings/semantic similarity.
@@ -54,5 +54,27 @@ The following hyperparameters were kept constant:
 
 For evaluating cluster quality, I selected the Density-based Clustering Validation Index (DBCVI) as the optimization objective, which as the name implies is specifically designed for density-based clustering. More precisely, `hdbscan` provides a `_relative_validity` attribute that is a fast approximation suitable for comparing results. It had to be reimplemented to work with cuML's GPU library but the effort was minimal with the source code. I rejected other metrics often used for clustering tasks, like Ball Hall, Davies Bouldin, Calinski Harabasz, Silhouette, and R-squared indices as they make assumptions such as spherical clusters or equal densities that I wasn't sure would align with the semantic structure of academic papers. I also considered 'trustworthiness' as a metric specifically for evaluating UMAP reduction quality, but given that UMAP quality by itself was not the objective, and that I wanted to verify that using was actually better, I only saved it as a metric and did not use it for optimization.
 
-#### Results
+#### Optimization Results
+
+The best trial found was # 451, with a relative validity of 0.294. The parameters used were:
+```json
+{
+    "use_umap": true,
+    "n_components": 37,
+    "n_neighbors": 48,
+    "min_cluster_size": 96,
+    "min_samples": 21,
+    "cluster_selection_epsilon": 0.166
+}
+```
+
+> Given that the min_cluster_size is so close the the end of the range, it suggests that a better clustering could have been found with an expanded range. 
+
+#### Clustering Results
+
+HDBSCAN identified 153 clusters, which is about expected given all `cs.AI` papers were clustered, and a high-granularity was sought. However, a relatively high noise ratio of 49.57% indicates that about half of the papers couldn't be confidently assigned to any cluster. While this could mean either emerging research areas or papers that bridge multiple domains, it's more likely that further work should be done on the clustering parameters. The clusters also show considerable variation in size (standard deviation of 402 papers) with a size ratio of 29.6 between the largest and smallest clusters. This could be a mix of the presence of both mainstream research areas and more specialized niches, as well as insufficiently granular clustering. The average cluster probability of 0.43 (±0.45) indicates moderate confidence in the cluster assignments, while the mean persistence of 0.125 suggests the clusters are reasonably stable. The trust score of 0.66 for the UMAP dimensionality reduction demonstrates that the lower-dimensional representation preserved a good portion of the original semantic relationships between papers. The relative validity of 0.2943 cannot be used as a measure of the quality of the clustering directly, and a full score needs to be computed.
+
+> I had issues calculating the full DBCVI score. I suspect there was some bug in how the data was stored in the database, and a new clustering might be needed.
+
+### Phase 4: Labeling
 
