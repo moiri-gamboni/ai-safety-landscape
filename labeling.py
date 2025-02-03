@@ -180,7 +180,6 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from psycopg2.extras import DictCursor
 import time
 from google.genai import types
-from pydantic import BaseModel
 
 # Configure Gemini API
 # @title Gemini API Key
@@ -188,29 +187,12 @@ gemini_api_key = "" # @param {type:"string"}
 client = genai.Client(api_key=gemini_api_key)
 
 MODEL_ID = "gemini-2.0-flash-exp"
-class PaperLabel(BaseModel):
-    category: str
-    relevance_score: float
-    confidence: float
 
 # %%
 def create_label_columns():
     """Create columns for labeling results matching db_schema.md"""
     with conn.cursor() as cursor:
-        cursor.execute('''
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'papers' 
-            AND column_name IN ('llm_category', 'safety_relevance', 'label_confidence')
-        ''')
-        existing_columns = {row[0] for row in cursor.fetchall()}
-        
-        if 'llm_category' not in existing_columns:
-            cursor.execute('ALTER TABLE papers ADD COLUMN llm_category TEXT')
-        if 'safety_relevance' not in existing_columns:
-            cursor.execute('ALTER TABLE papers ADD COLUMN safety_relevance FLOAT')
-        if 'label_confidence' not in existing_columns:
-            cursor.execute('ALTER TABLE papers ADD COLUMN label_confidence FLOAT')
+        cursor.execute('ALTER TABLE papers ADD COLUMN IF NOT EXISTS llm_category TEXT')
         conn.commit()
 
 # Create columns before processing
@@ -221,20 +203,23 @@ def get_paper_batches(batch_size=400):
     """Generator yielding batches of papers needing labeling"""
     cursor = conn.cursor(cursor_factory=DictCursor)
     
-    # Get total count of papers needing labels
+    # Set random seed FIRST
+    cursor.execute('SELECT setseed(0.42);')  # Fixed seed
+    
     cursor.execute('''
         SELECT COUNT(*) 
         FROM papers 
-
+        WHERE llm_category IS NULL
     ''')
     
     total_papers = cursor.fetchone()[0]
     
-    # Simplified query without category filtering
+    # Random order query
     cursor.execute('''
         SELECT id, title, abstract 
         FROM papers
-        ORDER BY id
+        WHERE llm_category IS NULL
+        ORDER BY random()
     ''')
     
     batch = []
@@ -251,7 +236,7 @@ def get_paper_batches(batch_size=400):
 
 
 # %%
-# Rate limiter class matching Gemini 1.5 Flash limits
+# Rate limiter class matching Gemini 2.0 Flash limits
 class GeminiRateLimiter:
     def __init__(self):
         self.rpm_limit = 10  # Requests per minute
@@ -295,6 +280,78 @@ class GeminiRateLimiter:
 rate_limiter = GeminiRateLimiter()
 
 # %%
+class TokenTracker:
+    def __init__(self):
+        self.total_input = 0
+        self.total_output = 0
+        self.batches_processed = 0
+        
+    def add_batch(self, input_tokens, output_tokens):
+        self.total_input += input_tokens
+        self.total_output += output_tokens
+        self.batches_processed += 1
+        
+    def print_summary(self):
+        print("\n=== Token Usage Summary ===")
+        print(f"Total batches processed: {self.batches_processed}")
+        print(f"Total input tokens: {self.total_input}")
+        print(f"Total output tokens: {self.total_output}")
+        print(f"Total tokens used: {self.total_input + self.total_output}")
+
+token_tracker = TokenTracker()
+
+# %%
+@retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
+def generate_labels(batch):
+    """Generate labels for a batch of papers using Gemini"""
+    base_prompt = """You are an expert in AI and machine learning. Your task is to categorize academic papers.
+For each paper, provide a specific technical category using precise technical terminology that describes the primary research focus.
+Categories should be specific enough to differentiate between similar papers yet broad enough to actually group papers (e.g. "Reward Modeling for RLHF" rather than "Reinforcement Learning" or "Regularizing Hidden States Enables Learning Generalizable Reward Model for RLHF")
+
+Papers to analyze:
+"""
+    
+    prompt = base_prompt
+    batch_size = len(batch)
+    for paper in batch:
+        prompt += f"\n\nTitle: {paper['title']}\nAbstract: {paper['abstract']}"
+    # Build schema as dictionary
+    schema = {
+        "type": "ARRAY",
+        "items": {
+            "type": "STRING",
+        },
+        "minItems": batch_size,
+        "maxItems": batch_size
+    }
+    
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema
+        )
+    )
+    
+    if not response.usage_metadata:
+        raise ValueError("Missing usage metadata in response")
+    
+    input_tokens = response.usage_metadata.prompt_token_count
+    output_tokens = response.usage_metadata.candidates_token_count
+    
+    # Update rate limiter and tracker
+    rate_limiter.add_request(input_tokens, output_tokens)
+    token_tracker.add_batch(input_tokens, output_tokens)
+    
+    # Add truncation check
+    if output_tokens >= 8192:
+        print(f"Warning: Output tokens at limit ({output_tokens}), response may be truncated")
+
+    print(response.text)
+    
+    return json.loads(response.text), input_tokens, output_tokens
+
 def test_token_count():
     """Test token counting with real data batch"""
     try:
@@ -322,88 +379,6 @@ def test_token_count():
 # Run updated test
 test_token_count()
 
-# %%
-class TokenTracker:
-    def __init__(self):
-        self.total_input = 0
-        self.total_output = 0
-        self.batches_processed = 0
-        
-    def add_batch(self, input_tokens, output_tokens):
-        self.total_input += input_tokens
-        self.total_output += output_tokens
-        self.batches_processed += 1
-        
-    def print_summary(self):
-        print("\n=== Token Usage Summary ===")
-        print(f"Total batches processed: {self.batches_processed}")
-        print(f"Total input tokens: {self.total_input}")
-        print(f"Total output tokens: {self.total_output}")
-        print(f"Total tokens used: {self.total_input + self.total_output}")
-
-token_tracker = TokenTracker()
-
-# %%
-@retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
-def generate_labels(batch):
-    """Generate labels for a batch of papers using Gemini"""
-    base_prompt = """You are an expert in AI safety and machine learning. Your task is to categorize academic papers and assess their relevance to AI safety.
-
-For each paper, provide:
-1. A specific technical category that precisely describes the primary research focus (e.g. "Adversarial Attack Detection" rather than "AI Safety", or "Reward Modeling for RLHF" rather than "Reinforcement Learning")
-2. A relevance score (0-1) indicating how relevant it is to AI safety research
-3. Your confidence (0-1) in this categorization
-
-Guidelines:
-- Use precise technical terminology
-- Categories should be specific enough to differentiate between similar papers
-- Consider both direct and indirect relevance to AI safety
-- Be consistent in scoring across papers
-
-Papers to analyze:
-"""
-    
-    prompt = base_prompt
-    batch_size = len(batch)
-    for paper in batch:
-        prompt += f"\n\nTitle: {paper['title']}\nAbstract: {paper['abstract']}"
-
-    # Count tokens
-    count_response = client.models.count_tokens(
-        model=MODEL_ID,
-        contents=prompt,
-    )
-    input_tokens = count_response.total_tokens
-    
-    # Check rate limits (using actual output tokens)
-    response = client.models.generate_content(
-        model=MODEL_ID,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type="ARRAY",
-                items=PaperLabel,
-                min_items=batch_size,
-                max_items=batch_size
-            ),
-        ),
-    )
-    
-    if not response.usage_metadata:
-        raise ValueError("Missing usage metadata in response")
-    
-    output_tokens = response.usage_metadata.candidates_token_count
-    
-    # Update rate limiter and tracker
-    rate_limiter.add_request(input_tokens, output_tokens)
-    token_tracker.add_batch(input_tokens, output_tokens)
-    
-    # Add truncation check
-    if output_tokens >= 8192:
-        print(f"Warning: Output tokens at limit ({output_tokens}), response may be truncated")
-    
-    return json.loads(response.text), input_tokens, output_tokens
 
 # %%
 def process_batches():
@@ -411,6 +386,18 @@ def process_batches():
     for batch in get_paper_batches():
         try:
             labels, input_toks, output_toks = generate_labels(batch)
+            
+            # Validate label count matches batch size
+            if len(labels) != len(batch):
+                print(f"Label count mismatch: {len(labels)} vs {len(batch)}")
+                if len(labels) > len(batch):
+                    labels = labels[:len(batch)]  # Truncate extra labels
+                else:
+                    # Leave missing labels as NULL by not updating those papers
+                    print("Warning: Insufficient labels - skipping unlabeled papers")
+                    batch = batch[:len(labels)]  # Truncate batch to match labels
+                
+                print(f"Adjusted labels to {len(labels)} items")
             
             # Print batch stats
             print(f"Processed batch of {len(batch)} papers")
@@ -421,14 +408,10 @@ def process_batches():
                 for paper, label in zip(batch, labels):
                     cursor.execute('''
                         UPDATE papers
-                        SET llm_category = %s,
-                            safety_relevance = %s,
-                            label_confidence = %s
+                        SET llm_category = %s
                         WHERE id = %s
                     ''', (
-                        label.get('category'),
-                        label.get('relevance_score'),
-                        label.get('confidence'),
+                        label,  # Directly use the string category
                         paper['id']
                     ))
                 conn.commit()

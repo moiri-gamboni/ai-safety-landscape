@@ -11,8 +11,6 @@ CREATE TABLE papers (
     abstract TEXT, -- Full abstract text
     arxiv_categories TEXT[] NOT NULL, -- Array of arXiv categories (e.g. {'cs.AI','cs.LG'})
     llm_category TEXT, -- AI-generated category (from labeling.py)
-    safety_relevance FLOAT, -- 0-1 relevance score to AI safety
-    label_confidence FLOAT, -- 0-1 confidence in labeling
     msc_class TEXT, -- Mathematics Subject Classification
     acm_class TEXT, -- ACM classification
     doi TEXT, -- Digital Object Identifier
