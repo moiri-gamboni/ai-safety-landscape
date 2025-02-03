@@ -52,7 +52,7 @@ def load_database():
     """Load PostgreSQL backup using psql"""
     print("Loading PostgreSQL backup...")
     !createdb -U postgres papers # pyright: ignore
-    !pg_restore -U postgres --jobs=8 -d papers "{backup_path}" # pyright: ignore
+    !pg_restore -U postgres --jobs=8 -d papers "{db_path}" # pyright: ignore
 
 def connect_db():
     """Connect to PostgreSQL database with schema validation"""
