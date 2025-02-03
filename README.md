@@ -155,6 +155,14 @@ Full clustering results are available in [`cluster_results.md`](cluster_results.
 
 ##### Visualization
 
+A further 2D UMAP reductions is performed on the original embeddings. This allows for a visualization of the clusters. 
+
+![Cluster Scatter Plot](./all_clusters.png)
+![Top 10 Clusters by Size](./top_10_clusters_by_size.png)
+![Top 10 Clusters by Safety Relevance](./top_10_clusters_by_safety.png)
+![Safety Relevance Heatmap](./safety_heatmap.png)
+![Noise Points](./noise.png)
+
 ##### Discussion
 
-Clearly, there are gaps to the accidental overly restrictive `cs.AI` selection. For example, there are no clusters on existential risk or formal verification. However, the cluster sizes seem reasonable. It would be worth investigating the noise points in more details, as they represent a significant portion of the papers, and might fit in the existing clusters.
+Clearly, there are gaps to the accidental overly restrictive `cs.AI` selection. For example, there are no clusters on existential risk or formal verification. However, the cluster sizes seem reasonable. It would be worth investigating the noise points in more details, as they represent a significant portion of the papers, and might fit in the existing clusters. Finally, it seems that some clusters get spread out in the 2D UMAP reduction, due to the fact that they were clustered in a high-dimensional space. Potentially, 

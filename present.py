@@ -750,3 +750,265 @@ def backup_database():
     !pg_dump -U postgres -F c -f "{backup_path}" papers  # pyright: ignore
     print("Backup completed successfully")
 backup_database()
+
+# %%
+def plot_all_clusters_vs_noise(figsize=(15, 12)):
+    """Plot all clusters as single group vs noise"""
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, a.viz_embedding
+        FROM artifacts a
+        WHERE a.trial_id = %s
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Convert to arrays
+    cluster_ids = np.array([r[0] for r in results])
+    embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
+
+    plt.figure(figsize=figsize)
+    
+    # Plot noise
+    noise_mask = cluster_ids == -1
+    if np.any(noise_mask):
+        plt.scatter(
+            embeddings[noise_mask, 0],
+            embeddings[noise_mask, 1],
+            c='red',
+            marker='.',
+            alpha=0.5,
+            label='Noise',
+            s=1  # Added point size
+        )
+    
+    # Plot all clusters as single group
+    cluster_mask = cluster_ids != -1
+    plt.scatter(
+        embeddings[cluster_mask, 0],
+        embeddings[cluster_mask, 1],
+        c='blue',
+        marker='.',
+        alpha=0.5,
+        label='Clusters',
+        s=1  # Added point size
+    )
+    
+    plt.title('Cluster vs Noise Distribution')
+    plt.legend(
+        bbox_to_anchor=(0.5, -0.1),
+        loc='upper center',
+        ncol=2
+    )
+    plt.show()
+
+def plot_top10_clusters_by_size(figsize=(15, 10)):
+    """Plot only the 10 largest clusters without noise"""
+    # Get cluster sizes
+    labels = best_clusterer.labels_.get()
+    unique, counts = np.unique(labels[labels != -1], return_counts=True)
+    top_clusters = sorted(zip(counts, unique), reverse=True)[:10]
+    top_cluster_ids = {cid for _, cid in top_clusters}
+    
+    # Get all data
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, a.viz_embedding, cl.label
+        FROM artifacts a
+        LEFT JOIN cluster_labels cl ON a.cluster_id = cl.cluster_id
+        WHERE a.trial_id = %s
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Separate data
+    top_data = []
+    other_data = []
+    for r in results:
+        if r['cluster_id'] in top_cluster_ids:
+            top_data.append(r)
+        elif r['cluster_id'] != -1:  # Exclude noise
+            other_data.append(r)
+
+    # Process data
+    all_data = top_data + other_data
+    cluster_ids = np.array([r['cluster_id'] for r in all_data])
+    embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in all_data])
+    labels = [r[2] or f'Cluster {r[0]}' for r in all_data]
+
+    plt.figure(figsize=figsize)
+    
+    # Plot non-top clusters first in gray
+    if other_data:
+        other_mask = np.isin(cluster_ids, [r['cluster_id'] for r in other_data])
+        plt.scatter(
+            embeddings[other_mask, 0],
+            embeddings[other_mask, 1],
+            c='#CCCCCC',
+            marker='.',
+            alpha=0.3,
+            label='Other Clusters',
+            s=1
+        )
+    
+    # Plot top clusters with unique colors
+    colors = plt.cm.tab20(np.linspace(0, 1, len(top_cluster_ids)))
+    plotted_labels = set()
+    for idx, cid in enumerate(top_cluster_ids):
+        mask = cluster_ids == cid
+        cluster_label = [l for r, l in zip(all_data, labels) if r['cluster_id'] == cid][0]
+        
+        if cluster_label not in plotted_labels:
+            label = cluster_label
+            plotted_labels.add(cluster_label)
+        else:
+            label = None
+            
+        plt.scatter(
+            embeddings[mask, 0],
+            embeddings[mask, 1],
+            c=[colors[idx]],
+            marker='.',
+            alpha=0.7,
+            label=label,
+            s=1
+        )
+    
+    plt.title('Top 10 Clusters by Size')
+    plt.legend(
+        bbox_to_anchor=(0.5, -0.15),
+        loc='upper center',
+        ncol=2,
+        fontsize='small'
+    )
+    plt.tight_layout()
+    plt.show()
+
+def plot_top10_clusters_by_safety(figsize=(15, 10)):
+    """Plot only the 10 most safety-relevant clusters without noise"""
+    # Get safety scores
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT cluster_id, safety_relevance 
+            FROM cluster_labels
+            WHERE safety_relevance IS NOT NULL
+            ORDER BY safety_relevance DESC
+            LIMIT 10
+        ''')
+        top_clusters = [row['cluster_id'] for row in cursor.fetchall()]
+    
+    # Get all data
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, a.viz_embedding, cl.label
+        FROM artifacts a
+        LEFT JOIN cluster_labels cl ON a.cluster_id = cl.cluster_id
+        WHERE a.trial_id = %s AND a.cluster_id != -1
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Organize data by cluster
+    cluster_groups = {}
+    for r in results:
+        cid = r['cluster_id']
+        if cid not in cluster_groups:
+            cluster_groups[cid] = {
+                'embeddings': [],
+                'label': r['label'] or f'Cluster {cid}'
+            }
+        cluster_groups[cid]['embeddings'].append(np.frombuffer(r[1], dtype=np.float32))
+    
+    # Separate top clusters from others
+    top_data = {cid: data for cid, data in cluster_groups.items() if cid in top_clusters}
+    other_data = {cid: data for cid, data in cluster_groups.items() if cid not in top_clusters}
+    
+    plt.figure(figsize=figsize)
+    
+    # Plot other clusters in gray
+    if other_data:
+        all_other = np.vstack([np.array(data['embeddings']) for data in other_data.values()])
+        plt.scatter(
+            all_other[:, 0],
+            all_other[:, 1],
+            c='#CCCCCC',
+            marker='.',
+            alpha=0.3,
+            label='Other Clusters',
+            s=1
+        )
+    
+    # Plot top clusters with distinct colors
+    colors = plt.cm.tab20(np.linspace(0, 1, len(top_data)))
+    for idx, (cid, data) in enumerate(top_data.items()):
+        embeddings = np.array(data['embeddings'])
+        plt.scatter(
+            embeddings[:, 0],
+            embeddings[:, 1],
+            c=[colors[idx]],
+            marker='.',
+            alpha=0.7,
+            label=data['label'],
+            s=1
+        )
+    
+    plt.title('Top 10 Clusters by Safety Relevance')
+    plt.legend(
+        bbox_to_anchor=(0.5, -0.15),
+        loc='upper center',
+        ncol=2,
+        fontsize='small'
+    )
+    plt.tight_layout()
+    plt.show()
+
+def plot_safety_relevance_heatmap(figsize=(15, 10)):
+    """Plot all clusters colored by their safety relevance scores"""
+    # Get safety scores for all clusters
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT cl.cluster_id, cl.safety_relevance
+            FROM cluster_labels cl
+            WHERE cl.safety_relevance IS NOT NULL
+        ''')
+        safety_scores = {row['cluster_id']: row['safety_relevance'] for row in cursor.fetchall()}
+    
+    # Get visualization data
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT a.cluster_id, a.viz_embedding
+        FROM artifacts a
+        WHERE a.trial_id = %s AND a.cluster_id != -1
+    ''', (best_trial,))
+    results = cursor.fetchall()
+    
+    # Process data
+    cluster_ids = np.array([r['cluster_id'] for r in results])
+    embeddings = np.vstack([np.frombuffer(r[1], dtype=np.float32) for r in results])
+    
+    # Create color values
+    colors = [safety_scores.get(cid, 0) for cid in cluster_ids]
+    norm = plt.Normalize(0, 1)
+    cmap = plt.cm.RdYlGn  # Red-Yellow-Green colormap
+
+    plt.figure(figsize=figsize)
+    
+    # Plot all points
+    scatter = plt.scatter(
+        embeddings[:, 0],
+        embeddings[:, 1],
+        c=colors,
+        cmap=cmap,
+        norm=norm,
+        marker='.',
+        alpha=0.7,
+        s=1
+    )
+    
+    # Add colorbar
+    cbar = plt.colorbar(scatter, shrink=0.5)
+    cbar.set_label('Safety Relevance Score')
+    
+    plt.title('Cluster Safety Relevance Heatmap')
+    plt.tight_layout()
+    plt.show()
+
+# Add to visualization section
+plot_safety_relevance_heatmap()

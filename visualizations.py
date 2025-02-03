@@ -94,6 +94,12 @@ from scipy.cluster.hierarchy import dendrogram
 from scipy.spatial.distance import cdist, squareform
 from umap import UMAP
 
+# Add to imports section
+from google import genai
+from tqdm.auto import tqdm
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+import asyncio
+
 # %% [markdown]
 # ## Helper Functions
 
@@ -367,6 +373,144 @@ def backup_database():
     print(f"Creating compressed backup at {backup_path}")
     !pg_dump -U postgres -F c -f "{backup_path}" papers # pyright: ignore
     print("Backup completed successfully")
+
+# %%
+# Add after database connection setup
+# Configure Gemini API
+gemini_api_key = ""  # Should be set by user
+client = genai.Client(api_key=gemini_api_key)
+MODEL_ID = "gemini-1.5-flash"
+
+# Add to helper functions section
+def create_cluster_label_columns():
+    """Create columns for cluster labeling results"""
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cluster_metrics (
+                trial_id INTEGER NOT NULL,
+                cluster_id INTEGER NOT NULL,
+                validity_index REAL,
+                density_separation REAL,
+                llm_label TEXT,
+                PRIMARY KEY (trial_id, cluster_id)
+            )
+        ''')
+        conn.commit()
+
+def get_clusters_needing_labels():
+    """Generator yielding clusters needing labeling"""
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT c.cluster_id 
+        FROM cluster_metrics c
+        LEFT JOIN artifacts a ON c.cluster_id = a.cluster_id
+        WHERE c.llm_label IS NULL
+        GROUP BY c.cluster_id
+        HAVING COUNT(a.paper_id) > 0
+    ''')
+    
+    return [row[0] for row in cursor.fetchall()]
+
+class GeminiRateLimiter:
+    def __init__(self):
+        self.rpm_limit = 10
+        self.tpm_limit = 4_000_000
+        self.rpd_limit = 1_500
+        self.requests = []
+        self.tokens = []
+        self.daily_count = 0
+        
+    def can_make_request(self, input_tokens, output_tokens):
+        current_time = time.time()
+        cutoff_time = current_time - 60
+            
+        if self.daily_count >= self.rpd_limit:
+            return False
+            
+        recent_requests = [t for t in self.requests if t > cutoff_time]
+        if len(recent_requests) >= self.rpm_limit:
+            return False
+            
+        recent_tokens = sum(c for t, c in self.tokens if t > cutoff_time)
+        total_tokens = recent_tokens + input_tokens + output_tokens
+        if total_tokens > self.tpm_limit:
+            return False
+            
+        return True
+        
+    def add_request(self, input_tokens, output_tokens):
+        current_time = time.time()
+        self.requests.append(current_time)
+        self.tokens.append((current_time, input_tokens + output_tokens))
+        self.daily_count += 1
+
+rate_limiter = GeminiRateLimiter()
+
+@retry(wait=wait_random_exponential(multiplier=1, max=60), stop=stop_after_attempt(6))
+async def generate_cluster_label(cluster_id):
+    """Generate label for a cluster using Gemini"""
+    analysis = analyze_cluster_at_level(cluster_id, 0)
+    papers = analysis['papers']
+    
+    base_prompt = """You are an expert in AI safety research. Analyze this cluster of papers and provide a concise technical label that captures their common research theme. The label should be specific enough to differentiate from similar clusters yet broad enough to encompass all papers.
+
+Example format: "Adversarial Robustness in Neural Networks through Gradient Regularization"
+
+Papers in cluster:
+"""
+    
+    prompt = base_prompt
+    for paper in papers[:10]:  # Use first 10 papers for context
+        prompt += f"\n\n- {paper[1]}: {paper[2][:300]}..."
+    
+    response = await client.aio.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="text/plain"
+        )
+    )
+    
+    if not response.usage_metadata:
+        raise ValueError("Missing usage metadata in response")
+    
+    rate_limiter.add_request(
+        response.usage_metadata.prompt_token_count,
+        response.usage_metadata.candidates_token_count
+    )
+    
+    return response.text.strip()
+
+async def label_clusters_async():
+    """Main async processing loop for cluster labeling"""
+    create_cluster_label_columns()
+    clusters = get_clusters_needing_labels()
+    
+    try:
+        semaphore = asyncio.Semaphore(5)
+        
+        async def process_cluster(cluster_id):
+            async with semaphore:
+                try:
+                    label = await generate_cluster_label(cluster_id)
+                    with conn.cursor() as cursor:
+                        cursor.execute('''
+                            UPDATE cluster_metrics
+                            SET llm_label = %s
+                            WHERE cluster_id = %s AND trial_id = %s
+                        ''', (label, cluster_id, best_trial))
+                        conn.commit()
+                    print(f"Labeled cluster {cluster_id}: {label}")
+                except Exception as e:
+                    print(f"Error labeling cluster {cluster_id}: {str(e)}")
+                    conn.rollback()
+        
+        await asyncio.gather(*[process_cluster(cid) for cid in clusters])
+        
+    finally:
+        # Remove the problematic close call
+        pass  # Client cleanup handled automatically
 
 # %% [markdown]
 # ## Visualization Functions
@@ -789,6 +933,10 @@ def print_cluster_hierarchy(max_depth=None):
     for root_id in root_clusters:
         print_cluster(root_id)
 
+# %%
+await label_clusters_async()
+
+
 # %% [markdown]
 ## Example Usage
 
@@ -810,3 +958,5 @@ plot_cluster_dendrogram()
 plot_cluster_network()
 plot_hierarchical_clusters()
 print_cluster_hierarchy(max_depth=2)
+await label_clusters_async()
+
