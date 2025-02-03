@@ -287,7 +287,7 @@ Papers to analyze:
         "required": ["label", "safety_relevance"]
     }
     
-    response = await client.aio.generate_content(
+    response = await client.aio.models.generate_content(
         model=MODEL_ID,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -347,6 +347,10 @@ async def process_leaf_clusters_async():
 def update_cluster_label(cluster_id, label_data, representatives):
     """Store label and relevance score in database"""
     with conn.cursor() as cursor:
+        # Convert numpy types to native Python types
+        cluster_id = int(cluster_id)
+        safety_relevance = float(label_data['safety_relevance'])
+        
         cursor.execute('''
             INSERT INTO cluster_labels
             (cluster_id, label, safety_relevance, representative_ids)
@@ -358,7 +362,7 @@ def update_cluster_label(cluster_id, label_data, representatives):
         ''', (
             cluster_id,
             label_data['label'],
-            label_data['safety_relevance'],
+            safety_relevance,
             [r['id'] for r in representatives]
         ))
         conn.commit()
